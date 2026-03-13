@@ -5,7 +5,7 @@
     Sets the registry keys to trigger Secure Boot certificate deployment
     and opt in to Microsoft's Controlled Feature Rollout.
 
-    This script is safe to run on devices that have already been updated —
+    This script is safe to run on devices that have already been updated --
     if status is "Updated" or the cert is already present, it skips
     the update trigger to avoid unnecessary processing.
 
@@ -32,7 +32,7 @@ if (-not $secureBootEnabled) {
     exit 1
 }
 
-# Check if running in a virtual machine — hypervisors block UEFI variable writes
+# Check if running in a virtual machine -- hypervisors block UEFI variable writes
 # Prefer excluding VMs from assignment; remediation exits successfully to avoid noise if they slip in
 try {
     $cs = Get-CimInstance Win32_ComputerSystem
@@ -46,7 +46,7 @@ if ($isVM) {
     exit 0
 }
 
-# Check if device is in an error state — don't retry, it needs manual investigation
+# Check if device is in an error state -- don't retry, it needs manual investigation
 try {
     $errVal = Get-ItemProperty -Path $sbServicingPath -Name 'UEFICA2023Error' -ErrorAction SilentlyContinue
     if ($null -ne $errVal -and $null -ne $errVal.UEFICA2023Error -and $errVal.UEFICA2023Error -ne 0) {
@@ -55,7 +55,7 @@ try {
     }
 } catch { }
 
-# Check UEFICA2023Status — this is the authoritative servicing key from Microsoft
+# Check UEFICA2023Status -- this is the authoritative servicing key from Microsoft
 $servicingKeyExists = Test-Path $sbServicingPath
 try {
     $status = Get-ItemProperty -Path $sbServicingPath -Name 'UEFICA2023Status' -ErrorAction SilentlyContinue
@@ -69,7 +69,7 @@ try {
     }
 } catch { }
 
-# Best-effort firmware check — ASCII parsing of UEFI signature databases is not guaranteed
+# Best-effort firmware check -- ASCII parsing of UEFI signature databases is not guaranteed
 # to work on all OEM implementations. Only used as a fallback when the Servicing key is
 # absent or has no status (e.g. device updated via BIOS without Windows involvement)
 if (-not $servicingKeyExists -or ($null -eq $status) -or ($null -eq $status.UEFICA2023Status)) {
@@ -102,8 +102,8 @@ try {
         "UEFICA2023Error=$( if ($null -ne $currentErr.UEFICA2023Error) { $currentErr.UEFICA2023Error } else { 'none' } ), " +
         "OptIn=$( if ($null -ne $currentOptIn.MicrosoftUpdateManagedOptIn) { $currentOptIn.MicrosoftUpdateManagedOptIn } else { 'not set' } ), " +
         "OptOut=$( if ($null -ne $currentOptOut.HighConfidenceOptOut) { $currentOptOut.HighConfidenceOptOut } else { 'not set' } )"
-    if (-not $servicingKeyExists) { $stateMsg += " [Servicing key does not exist — update has never been initiated on this device]" }
-    elseif ($null -eq $currentStatus.UEFICA2023Status) { $stateMsg += " [Servicing key exists but status is not set — update may not have started yet]" }
+    if (-not $servicingKeyExists) { $stateMsg += " [Servicing key does not exist -- update has never been initiated on this device]" }
+    elseif ($null -eq $currentStatus.UEFICA2023Status) { $stateMsg += " [Servicing key exists but status is not set -- update may not have started yet]" }
     Write-Output $stateMsg
 } catch { }
 
@@ -112,14 +112,14 @@ $errors = @()
 
 # 1. Set AvailableUpdates to 0x5944 (full certificate deployment sequence)
 #    Triggers: KEK 2023, UEFI CA 2023, Production PCA, and boot manager update
-#    Skip if already non-zero — update is already in progress and resetting would delay it
+#    Skip if already non-zero -- update is already in progress and resetting would delay it
 try {
     $av = Get-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue
     if ($null -eq $av -or $av.AvailableUpdates -eq 0) {
         Set-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -Value 0x5944 -Type DWord -Force
         Write-Output "Set AvailableUpdates = 0x5944"
     } else {
-        Write-Output "AvailableUpdates already set to $('0x{0:X}' -f $av.AvailableUpdates) — update in progress, skipping reset"
+        Write-Output "AvailableUpdates already set to $('0x{0:X}' -f $av.AvailableUpdates) -- update in progress, skipping reset"
     }
 } catch {
     $errors += "Failed to set AvailableUpdates: $_"
@@ -139,7 +139,7 @@ try {
     Set-ItemProperty -Path $sbPath -Name 'HighConfidenceOptOut' -Value 0 -Type DWord -Force
     Write-Output "Set HighConfidenceOptOut = 0"
 } catch {
-    # Non-fatal — log but continue
+    # Non-fatal -- log but continue
     Write-Output "WARNING: Failed to set HighConfidenceOptOut: $_"
 }
 
