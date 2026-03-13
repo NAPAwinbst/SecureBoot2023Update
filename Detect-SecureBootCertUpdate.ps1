@@ -116,13 +116,13 @@ try {
 } catch { }
 
 try {
-    # CanAttemptUpdateAfter path varies by Windows version — try both locations
+    # CanAttemptUpdateAfter path varies by Windows version -- try both locations
     $throttle = Get-ItemProperty -Path $sbDeviceAttributesPath -Name 'CanAttemptUpdateAfter' -ErrorAction SilentlyContinue
     if ($null -eq $throttle) {
         $throttle = Get-ItemProperty -Path "$sbServicingPath\DeviceAttributes" -Name 'CanAttemptUpdateAfter' -ErrorAction SilentlyContinue
     }
     if ($null -ne $throttle.CanAttemptUpdateAfter -and $throttle.CanAttemptUpdateAfter -ne 0) {
-        # Value is a Windows FILETIME (100-nanosecond intervals since 1601-01-01) — convert to ISO 8601
+        # Value is a Windows FILETIME (100-nanosecond intervals since 1601-01-01) -- convert to ISO 8601
         $result.CanAttemptUpdateAfter = [DateTime]::FromFileTimeUtc($throttle.CanAttemptUpdateAfter).ToString('o')
     }
 } catch { }
@@ -142,7 +142,7 @@ try {
     if ($null -ne $capable.WindowsUEFICA2023Capable) { $result.WindowsUEFICA2023Capable = $capable.WindowsUEFICA2023Capable }
 } catch { }
 
-# --- Check event logs (last 30 days only — unbounded queries can timeout on large logs) ---
+# --- Check event logs (last 30 days only -- unbounded queries can timeout on large logs) ---
 $eventCutoff = (Get-Date).AddDays(-30)
 
 try {
@@ -189,7 +189,7 @@ if ($result.UEFICA2023Status -eq 'InProgress' -or $result.UEFICA2023Status -eq 1
 }
 
 # Fallback: if servicing status is absent, attempt best-effort firmware certificate check.
-# Only read UEFI DB/KEK when we actually need them — avoids unnecessary UEFI reads and
+# Only read UEFI DB/KEK when we actually need them -- avoids unnecessary UEFI reads and
 # noisy false negatives in JSON fields when servicing keys already gave a definitive answer.
 if ([string]::IsNullOrWhiteSpace($result.UEFICA2023Status) -or $result.UEFICA2023Status -eq 'NotStarted') {
     $result.FirmwareCertCheckPerformed = $true
