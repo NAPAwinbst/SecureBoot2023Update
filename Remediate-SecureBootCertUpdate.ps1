@@ -14,7 +14,7 @@
 .NOTES
     Deploy as: Remediation script in Intune Remediations
     Run as: System (64-bit)
-    Version: 3.2
+    Version: 3.3
 #>
 
 $sbPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot'
@@ -72,7 +72,7 @@ try {
 # Best-effort firmware check -- ASCII parsing of UEFI signature databases is not guaranteed
 # to work on all OEM implementations. Only used as a fallback when the Servicing key is
 # absent or has no status (e.g. device updated via BIOS without Windows involvement)
-if (-not $servicingKeyExists -or ($null -eq $status) -or ($null -eq $status.UEFICA2023Status)) {
+if (-not $servicingKeyExists -or ($null -eq $status) -or ($null -eq $status.UEFICA2023Status) -or $status.UEFICA2023Status -eq 'NotStarted') {
     try {
         $db = Get-SecureBootUEFI -Name db
         $dbString = [System.Text.Encoding]::ASCII.GetString($db.Bytes)
