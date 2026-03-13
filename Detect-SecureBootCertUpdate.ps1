@@ -19,7 +19,7 @@
 .NOTES
     Deploy as: Detection script in Intune Remediations
     Run as: System (64-bit)
-    Version: 3.2
+    Version: 3.3
 #>
 
 $result = [ordered]@{
