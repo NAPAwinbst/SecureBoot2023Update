@@ -2,24 +2,117 @@
 .SYNOPSIS
     Intune Remediation Script - Secure Boot 2023 Certificate Update
 .DESCRIPTION
-    Sets the registry keys to trigger Secure Boot certificate deployment
-    and opt in to Microsoft's Controlled Feature Rollout.
+    Sets the registry keys to trigger Secure Boot certificate deployment,
+    opts in to Microsoft's Controlled Feature Rollout, and starts the
+    Secure Boot update scheduled task to expedite processing.
 
     This script is safe to run on devices that have already been updated --
     if status is "Updated" or the cert is already present, it skips
     the update trigger to avoid unnecessary processing.
 
     Exit 0 = Remediation applied, already updated, in progress, or not applicable (VM)
-    Exit 1 = Remediation failed, Secure Boot disabled, or firmware error (needs investigation)
+    Exit 1 = Remediation failed, Secure Boot disabled, firmware error, or prerequisites not met
 .NOTES
     Deploy as: Remediation script in Intune Remediations
     Run as: System (64-bit)
-    Version: 3.3
+    Version: 4.0
+    Based on original work by @MrTbone_se (T-bone Granheden) - MIT License
 #>
 
+#region ---------------------------------------------------[Functions]------------------------------------------------------------
+function Get-SecureBootCertSubjects {
+<#
+.SYNOPSIS
+    Parse Secure Boot database signatures and return them as objects
+.DESCRIPTION
+    Parses the EFI signature database and returns an array of PSCustomObjects
+    with proper X.509 certificate parsing.
+.NOTES
+    Original Author: @MrTbone_se (T-bone Granheden)
+#>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Database
+    )
+    $db = (Get-SecureBootUEFI -Name $Database).Bytes
+    $EFI_CERT_X509_GUID = [guid]"a5c059a1-94e4-4aa7-87b5-ab155c2bf072"
+    $EFI_CERT_SHA256_GUID = [guid]"c1c41626-504c-4092-aca9-41f936934328"
+    $signatures = @()
+    for ($o = 0; $o -lt $db.Length; ) {
+        $guid = [Guid][Byte[]]$db[$o..($o+15)]
+        $signatureListSize = [BitConverter]::ToUInt32($db, $o+16)
+        $signatureSize = [BitConverter]::ToUInt32($db, $o+24)
+        $signatureCount = ($signatureListSize - 28) / $signatureSize
+        $so = $o + 28
+        for ($i = 0; $i -lt $signatureCount; $i++) {
+            $signatureOwner = [Guid][Byte[]]$db[$so..($so+15)]
+            if ($guid -eq $EFI_CERT_X509_GUID) {
+                $certBytes = $db[($so+16)..($so+16+$signatureSize-1)]
+                try {
+                    $cert = if ($PSEdition -eq "Core") {
+                        [System.Security.Cryptography.X509Certificates.X509Certificate]::new([Byte[]]$certBytes)
+                    } else {
+                        $c = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+                        $c.Import([Byte[]]$certBytes)
+                        $c
+                    }
+                    $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; SignatureSubject=$cert.Subject; Signature=$cert; SignatureType=$guid}
+                } catch {
+                    $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; SignatureSubject="Failed to parse cert"; Signature=$null; SignatureType=$guid}
+                }
+            } elseif ($guid -eq $EFI_CERT_SHA256_GUID) {
+                $sha256Hash = ([Byte[]]$db[($so+16)..($so+47)] | ForEach-Object { $_.ToString('X2') }) -join ''
+                $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; Signature=$sha256Hash; SignatureType=$guid}
+            } else {
+                $unknownData = [Byte[]]$db[($so+16)..($so+16+$signatureSize-1)]
+                $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; SignatureSubject="Unknown signature type"; Signature=$unknownData; SignatureType=$guid}
+            }
+            $so += $signatureSize
+        }
+        $o += $signatureListSize
+    }
+    return $signatures
+}
+#endregion
+
+#region ---------------------------------------------------[Configuration]-------------------------------------------------------
+# OS versions and the required July 2024 patch level for Secure Boot Update prerequisite
+$OSversions = @(
+    @{ Name='Insider'; Build=26200; Patch=0 }
+    @{ Name='24H2'; Build=26100; Patch=1150 }
+    @{ Name='23H2'; Build=22631; Patch=3880 }
+    @{ Name='22H2'; Build=22621; Patch=3880 }
+    @{ Name='21H2'; Build=22000; Patch=3079 }
+    @{ Name='22H2(Win10)'; Build=19045; Patch=4651 }
+    @{ Name='21H2(Win10)'; Build=19044; Patch=4651 }
+    @{ Name='1809(LTSC)'; Build=17763; Patch=6054 }
+    @{ Name='1609(LTSC)'; Build=14393; Patch=7259 }
+)
+$RemediateTaskName = "\Microsoft\Windows\PI\Secure-Boot-Update"
+#endregion
+
+#region ---------------------------------------------------[Paths]---------------------------------------------------------------
 $sbPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot'
 $sbServicingPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing'
+#endregion
 
+#region ---------------------------------------------------[Prerequisites check]-------------------------------------------------
+# Validate 64-bit PowerShell
+if ([IntPtr]::Size -ne 8) {
+    Write-Output "ERROR: Script requires 64-bit PowerShell (running $([IntPtr]::Size * 8)-bit)."
+    exit 1
+}
+
+# Validate elevated privileges (SYSTEM or Administrator)
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$isElevated = $identity.User.Value -eq "S-1-5-18" -or ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isElevated) {
+    Write-Output "ERROR: Script requires elevated privileges (SYSTEM or Administrator)."
+    exit 1
+}
+#endregion
+
+#region ---------------------------------------------------[Safety checks]-------------------------------------------------------
 # Safety check: only proceed if Secure Boot is enabled
 try {
     $secureBootEnabled = Confirm-SecureBootUEFI
@@ -36,7 +129,7 @@ if (-not $secureBootEnabled) {
 # Prefer excluding VMs from assignment; remediation exits successfully to avoid noise if they slip in
 try {
     $cs = Get-CimInstance Win32_ComputerSystem
-    $isVM = $cs.Model -match 'Virtual Machine' -or $cs.Manufacturer -match 'VMware|QEMU|Xen|VirtualBox|innotek'
+    $isVM = $cs.Model -match 'Virtual Machine|Virtual|VMware|VirtualBox|Hyper-V|QEMU|Parallels' -or $cs.Manufacturer -match 'VMware|QEMU|Xen|VirtualBox|innotek'
 } catch {
     $isVM = $false
 }
@@ -45,7 +138,28 @@ if ($isVM) {
     Write-Output "Virtual machine detected ($($cs.Manufacturer) / $($cs.Model)). Secure Boot variable writes are hypervisor-controlled. This remediation intentionally exits successfully to avoid repeated noise. Exclude VMs or handle via VM-specific process."
     exit 0
 }
+#endregion
 
+#region ---------------------------------------------------[OS patch prerequisite check]-----------------------------------------
+try {
+    $cv = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $Build = if ($cv.CurrentBuildNumber) { try {[int]$cv.CurrentBuildNumber} catch { $null } } elseif ($cv.CurrentBuild) { try {[int]$cv.CurrentBuild} catch { $null } } else { $null }
+    $Patch = if ($null -ne $cv.UBR) { try {[int]$cv.UBR} catch { $null } } else { $null }
+    $OSversionsSorted = $OSversions | Sort-Object { [int]$_.Build } -Descending
+    $matchedOS = $OSversionsSorted | Where-Object { ($Build -ne $null) -and ([int]$_.Build -le $Build) } | Select-Object -First 1
+    $osPatchOk = $false
+    if ($matchedOS) {
+        if ($matchedOS['Patch'] -eq 0) { $osPatchOk = $true }
+        elseif ($null -ne $Patch -and $Patch -ge $matchedOS['Patch']) { $osPatchOk = $true }
+    }
+    if (-not $osPatchOk -and $null -ne $matchedOS) {
+        Write-Output "OS patch prerequisite not met. Current: $($matchedOS['Name']) $Build.$Patch, Required patch level: $($matchedOS['Patch']). Install the July 2024 cumulative update first."
+        exit 1
+    }
+} catch { }
+#endregion
+
+#region ---------------------------------------------------[Error state check]---------------------------------------------------
 # Check if device is in an error state -- don't retry, it needs manual investigation
 try {
     $errVal = Get-ItemProperty -Path $sbServicingPath -Name 'UEFICA2023Error' -ErrorAction SilentlyContinue
@@ -54,7 +168,9 @@ try {
         exit 1
     }
 } catch { }
+#endregion
 
+#region ---------------------------------------------------[Already-compliant checks]--------------------------------------------
 # Check UEFICA2023Status -- this is the authoritative servicing key from Microsoft
 $servicingKeyExists = Test-Path $sbServicingPath
 try {
@@ -69,27 +185,24 @@ try {
     }
 } catch { }
 
-# Best-effort firmware check -- ASCII parsing of UEFI signature databases is not guaranteed
-# to work on all OEM implementations. Only used as a fallback when the Servicing key is
-# absent or has no status (e.g. device updated via BIOS without Windows involvement)
+# Fallback firmware cert check using proper X.509 parsing
 if (-not $servicingKeyExists -or ($null -eq $status) -or ($null -eq $status.UEFICA2023Status) -or $status.UEFICA2023Status -eq 'NotStarted') {
     try {
-        $db = Get-SecureBootUEFI -Name db
-        $dbString = [System.Text.Encoding]::ASCII.GetString($db.Bytes)
-        $dbHas2023 = ($dbString -match 'Windows UEFI CA 2023')
+        $dbcerts = Get-SecureBootCertSubjects -Database db
+        $dbHas2023 = [bool]($dbcerts | Where-Object { $_.SignatureSubject -match 'Windows UEFI CA 2023' })
 
-        $kek = Get-SecureBootUEFI -Name kek
-        $kekString = [System.Text.Encoding]::ASCII.GetString($kek.Bytes)
-        $kekHas2023 = ($kekString -match 'Microsoft Corporation KEK 2K CA 2023')
+        $KEKcerts = Get-SecureBootCertSubjects -Database kek
+        $kekHas2023 = [bool]($KEKcerts | Where-Object { $_.SignatureSubject -match 'KEK 2K CA 2023' })
 
         if ($dbHas2023 -and $kekHas2023) {
-            Write-Output "Both 2023 certificates found in firmware (best-effort check). No action needed."
+            Write-Output "Both 2023 certificates found in firmware (X.509 cert check). No action needed."
             exit 0
         }
     } catch { }
 }
+#endregion
 
-# --- Log current state for troubleshooting ---
+#region ---------------------------------------------------[Log current state]---------------------------------------------------
 try {
     $currentAv = Get-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue
     $currentStatus = Get-ItemProperty -Path $sbServicingPath -Name 'UEFICA2023Status' -ErrorAction SilentlyContinue
@@ -106,8 +219,9 @@ try {
     elseif ($null -eq $currentStatus.UEFICA2023Status) { $stateMsg += " [Servicing key exists but status is not set -- update may not have started yet]" }
     Write-Output $stateMsg
 } catch { }
+#endregion
 
-# --- Apply registry keys ---
+#region ---------------------------------------------------[Apply registry keys]-------------------------------------------------
 $errors = @()
 
 # 1. Set AvailableUpdates to 0x5944 (full certificate deployment sequence)
@@ -143,13 +257,25 @@ try {
     Write-Output "WARNING: Failed to set HighConfidenceOptOut: $_"
 }
 
-# Check for critical errors
+# Check for critical errors before proceeding
 if ($errors.Count -gt 0) {
     foreach ($e in $errors) { Write-Output "ERROR: $e" }
     exit 1
 }
+#endregion
 
-# --- Post-write state snapshot (validates keys were actually written) ---
+#region ---------------------------------------------------[Start scheduled task]------------------------------------------------
+# Explicitly start the Secure Boot update scheduled task to expedite processing
+try {
+    Start-ScheduledTask -TaskName $RemediateTaskName -ErrorAction Stop
+    Write-Output "Secure Boot update scheduled task started ($RemediateTaskName)."
+} catch {
+    # Non-fatal -- task may not exist on all OS versions, or may already be running
+    Write-Output "WARNING: Could not start scheduled task '$RemediateTaskName': $_. The update will process on its normal schedule or after reboot."
+}
+#endregion
+
+#region ---------------------------------------------------[Post-write validation]-----------------------------------------------
 try {
     $postAv = Get-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue
     $postOptIn = Get-ItemProperty -Path $sbPath -Name 'MicrosoftUpdateManagedOptIn' -ErrorAction SilentlyContinue
@@ -157,5 +283,6 @@ try {
     Write-Output "Post-write state: AvailableUpdates=$( if ($null -ne $postAv.AvailableUpdates) { '0x{0:X}' -f $postAv.AvailableUpdates } else { 'not set' } ), OptIn=$( if ($null -ne $postOptIn.MicrosoftUpdateManagedOptIn) { $postOptIn.MicrosoftUpdateManagedOptIn } else { 'not set' } ), OptOut=$( if ($null -ne $postOptOut.HighConfidenceOptOut) { $postOptOut.HighConfidenceOptOut } else { 'not set' } )"
 } catch { }
 
-Write-Output "Remediation complete. The Secure-Boot-Update scheduled task will process on its normal schedule. At least one reboot is required to finalize. Optional: to expedite, run Start-ScheduledTask -TaskName '\Microsoft\Windows\PI\Secure-Boot-Update'"
+Write-Output "Remediation complete. At least one reboot is required to finalize the Secure Boot certificate update."
 exit 0
+#endregion
