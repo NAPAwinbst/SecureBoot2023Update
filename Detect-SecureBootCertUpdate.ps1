@@ -10,22 +10,24 @@
     device status for reporting in the Intune admin center.
 
     Status values:
-      "Updated"            - 2023 certs present, fully updated
-      "InProgress"         - Update sequence has started but not finished
-      "Error"              - Update was attempted but hit an error
-      "NotStarted"         - Secure Boot enabled but no update initiated
-      "SecureBootDisabled" - Secure Boot is off; cannot apply cert updates
-      "VirtualMachine"     - VM; benign not-applicable (aligned with remediation policy)
-      "PrerequisitesNotMet"- Script not running as 64-bit or elevated
-      "OSPatchMissing"     - Required July 2024 cumulative update not installed
+      "Updated"             - 2023 certs present, fully updated
+      "InProgress"          - Update sequence has started but not finished
+      "Error"               - Update was attempted but hit an error
+      "NotStarted"          - Secure Boot enabled but no update initiated
+      "SecureBootDisabled"  - Secure Boot is off; cannot apply cert updates
+      "VirtualMachine"      - VM; benign not-applicable (aligned with remediation policy)
+      "PrerequisitesNotMet" - Script not running as 64-bit or elevated
+      "OSPatchMissing"      - Required July 2024 cumulative update not installed
+      "BitLockerNotEscrowed"- BitLocker is on but recovery key not safely escrowed
 .NOTES
     Deploy as: Detection script in Intune Remediations
     Run as: System (64-bit)
-    Version: 4.0
+    Version: 5.1
     Based on original work by @MrTbone_se (T-bone Granheden) - MIT License
 #>
 
 #region ---------------------------------------------------[Functions]------------------------------------------------------------
+# IMPORTANT: This function is duplicated in the Remediation script - keep both in sync
 function Get-SecureBootCertSubjects {
 <#
 .SYNOPSIS
@@ -48,12 +50,13 @@ function Get-SecureBootCertSubjects {
         $guid = [Guid][Byte[]]$db[$o..($o+15)]
         $signatureListSize = [BitConverter]::ToUInt32($db, $o+16)
         $signatureSize = [BitConverter]::ToUInt32($db, $o+24)
-        $signatureCount = ($signatureListSize - 28) / $signatureSize
+        $signatureCount = [Math]::Floor(($signatureListSize - 28) / $signatureSize)
         $so = $o + 28
         for ($i = 0; $i -lt $signatureCount; $i++) {
             $signatureOwner = [Guid][Byte[]]$db[$so..($so+15)]
             if ($guid -eq $EFI_CERT_X509_GUID) {
-                $certBytes = $db[($so+16)..($so+16+$signatureSize-1)]
+                # Cert data starts after 16-byte SignatureOwner, length = signatureSize - 16
+                $certBytes = $db[($so+16)..($so+$signatureSize-1)]
                 try {
                     $cert = if ($PSEdition -eq "Core") {
                         [System.Security.Cryptography.X509Certificates.X509Certificate]::new([Byte[]]$certBytes)
@@ -70,7 +73,7 @@ function Get-SecureBootCertSubjects {
                 $sha256Hash = ([Byte[]]$db[($so+16)..($so+47)] | ForEach-Object { $_.ToString('X2') }) -join ''
                 $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; Signature=$sha256Hash; SignatureType=$guid}
             } else {
-                $unknownData = [Byte[]]$db[($so+16)..($so+16+$signatureSize-1)]
+                $unknownData = [Byte[]]$db[($so+16)..($so+$signatureSize-1)]
                 $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; SignatureSubject="Unknown signature type"; Signature=$unknownData; SignatureType=$guid}
             }
             $so += $signatureSize
@@ -100,7 +103,7 @@ $OSversions = @(
 $result = [ordered]@{
     Hostname              = $env:COMPUTERNAME
     CollectionTime        = (Get-Date -Format 'o')
-    SecureBootEnabled     = $false
+    SecureBootEnabled     = $null
     Cert2023InDB          = $false
     KEK2023Present        = $false
     UEFICA2023Status      = $null
@@ -125,7 +128,11 @@ $result = [ordered]@{
     Manufacturer          = $null
     Model                 = $null
     IsVirtualMachine      = $false
-    TPMPresent            = $false
+    BitLockerEnabled      = $null
+    BitLockerEncryptionMethod = $null
+    BitLockerKeyProtectors    = $null
+    BitLockerRecoveryEscrowed = $null
+    TPMPresent            = $null
     TPMEnabled            = $null
     TPMVersion            = $null
     TPMEventStatus        = $null
@@ -139,27 +146,8 @@ $result = [ordered]@{
 }
 #endregion
 
-#region ---------------------------------------------------[Prerequisites check]-------------------------------------------------
-# Validate 64-bit PowerShell
-if ([IntPtr]::Size -ne 8) {
-    $result.Status = 'PrerequisitesNotMet'
-    $result.Compliant = $false
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 1
-}
-
-# Validate elevated privileges (SYSTEM or Administrator)
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$isElevated = $identity.User.Value -eq "S-1-5-18" -or ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isElevated) {
-    $result.Status = 'PrerequisitesNotMet'
-    $result.Compliant = $false
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 1
-}
-#endregion
-
 #region ---------------------------------------------------[Device info]---------------------------------------------------------
+# Collect device info FIRST so it's always in the JSON output, even if prerequisites fail
 try {
     $bios = Get-CimInstance Win32_BIOS -Property SMBIOSBIOSVersion,ReleaseDate -ErrorAction SilentlyContinue
     $cs = Get-CimInstance Win32_ComputerSystem -Property Manufacturer,Model -ErrorAction SilentlyContinue
@@ -169,13 +157,13 @@ try {
     $result.Manufacturer = $cs.Manufacturer
     $result.Model = $cs.Model
     $result.OSVersion = $os.Version
-    $result.IsVirtualMachine = ($cs.Model -match 'Virtual Machine|Virtual|VMware|VirtualBox|Hyper-V|QEMU|Parallels' -or $cs.Manufacturer -match 'VMware|QEMU|Xen|VirtualBox|innotek')
+    $result.IsVirtualMachine = ($cs.Model -match 'Virtual Machine|VMware|VirtualBox|Hyper-V|QEMU|Parallels' -or $cs.Manufacturer -match 'VMware|QEMU|Xen|VirtualBox|innotek')
 } catch { }
 
-# Firmware type (BIOS vs UEFI)
+# Firmware type (BIOS vs UEFI) -- use registry method to avoid bcdedit localization issues
 try {
-    $BootMode = bcdedit 2>$null | Select-String "path.*efi" -ErrorAction SilentlyContinue
-    $result.FirmwareType = if ($null -ne $BootMode) { "UEFI" } else { "BIOS" }
+    $peFirmwareType = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control' -Name 'PEFirmwareType' -ErrorAction SilentlyContinue).PEFirmwareType
+    $result.FirmwareType = if ($peFirmwareType -eq 2) { "UEFI" } elseif ($peFirmwareType -eq 1) { "BIOS" } else { "Unknown" }
 } catch { $result.FirmwareType = "Unknown" }
 
 # TPM diagnostics
@@ -202,6 +190,70 @@ try {
 } catch { $result.DiskPartitionStyle = "Unknown" }
 #endregion
 
+#region ---------------------------------------------------[Prerequisites check]-------------------------------------------------
+# Validate 64-bit PowerShell
+if ([IntPtr]::Size -ne 8) {
+    $result.Status = 'PrerequisitesNotMet'
+    $result.Compliant = $false
+    Write-Output ($result | ConvertTo-Json -Compress)
+    exit 1
+}
+
+# Validate elevated privileges (SYSTEM or Administrator)
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$isElevated = $identity.User.Value -eq "S-1-5-18" -or ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isElevated) {
+    $result.Status = 'PrerequisitesNotMet'
+    $result.Compliant = $false
+    Write-Output ($result | ConvertTo-Json -Compress)
+    exit 1
+}
+#endregion
+
+#region ---------------------------------------------------[BitLocker status]----------------------------------------------------
+# Secure Boot DB changes alter PCR values that BitLocker validates at boot.
+# If recovery key is not escrowed, the user gets a BitLocker recovery screen they cannot pass.
+try {
+    $blVolume = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
+    if ($blVolume -and $blVolume.ProtectionStatus -eq 'On') {
+        $result.BitLockerEnabled = $true
+        $result.BitLockerEncryptionMethod = $blVolume.EncryptionMethod.ToString()
+        $result.BitLockerKeyProtectors = ($blVolume.KeyProtector | ForEach-Object { $_.KeyProtectorType.ToString() }) -join '; '
+        # Check if a RecoveryPassword protector exists (required for escrow to Entra ID)
+        $recoveryProtectors = $blVolume.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' }
+        if ($recoveryProtectors) {
+            # Check if recovery key has been backed up to AAD/Entra ID
+            # The FVE metadata in WMI tracks backup status
+            # Check if FVE policy requires AD/AAD backup (set by Intune/GPO)
+            $aadBackup = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\FVE" -Name 'ActiveDirectoryBackup' -ErrorAction SilentlyContinue
+            $osAdBackup = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\FVE" -Name 'OSActiveDirectoryBackup' -ErrorAction SilentlyContinue
+            if (($aadBackup -and $aadBackup.ActiveDirectoryBackup -eq 1) -or ($osAdBackup -and $osAdBackup.OSActiveDirectoryBackup -eq 1)) {
+                $result.BitLockerRecoveryEscrowed = $true
+            } else {
+                # Fallback: Intune-managed Entra-joined devices escrow keys automatically via MDM policy
+                $joinInfo = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo\*' -ErrorAction SilentlyContinue
+                $mdmEnroll = Test-Path 'HKLM:\SOFTWARE\Microsoft\Enrollments\*\DMClient' -ErrorAction SilentlyContinue
+                if ($joinInfo -and $mdmEnroll) {
+                    $result.BitLockerRecoveryEscrowed = $true
+                } else {
+                    $result.BitLockerRecoveryEscrowed = $false
+                }
+            }
+        } else {
+            # BitLocker is on but no RecoveryPassword protector exists — cannot escrow
+            $result.BitLockerRecoveryEscrowed = $false
+        }
+    } else {
+        $result.BitLockerEnabled = $false
+        $result.BitLockerRecoveryEscrowed = $null  # N/A — not encrypted
+    }
+} catch {
+    # BitLocker module not available or query failed
+    $result.BitLockerEnabled = $null
+    $result.BitLockerRecoveryEscrowed = $null
+}
+#endregion
+
 #region ---------------------------------------------------[OS patch prerequisite check]-----------------------------------------
 try {
     $cv = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
@@ -210,12 +262,12 @@ try {
     $OSversionsSorted = $OSversions | Sort-Object { [int]$_.Build } -Descending
     $matchedOS = $OSversionsSorted | Where-Object { ($Build -ne $null) -and ([int]$_.Build -le $Build) } | Select-Object -First 1
     if ($matchedOS) {
-        $result.OSName = "$($matchedOS['Name']) ($Build.$Patch)"
+        $result.OSName = "$($matchedOS['Name']) ($Build$(if($null -ne $Patch){".$Patch"}))"
         if ($matchedOS['Patch'] -eq 0) { $result.OSPatchCompliant = $true }
         elseif ($null -ne $Patch -and $Patch -ge $matchedOS['Patch']) { $result.OSPatchCompliant = $true }
         else { $result.OSPatchCompliant = $false }
     } else {
-        $result.OSName = "Unknown ($Build.$Patch)"
+        $result.OSName = "Unknown ($Build$(if($null -ne $Patch){".$Patch"}))"
         $result.OSPatchCompliant = $null
     }
 } catch { }
@@ -243,30 +295,6 @@ if (-not $result.SecureBootEnabled) {
     Write-Output ($result | ConvertTo-Json -Compress)
     exit 1
 }
-#endregion
-
-#region ---------------------------------------------------[Secure Boot certificate subjects]-------------------------------------
-# Collect PK, KEK, and DB certificate subjects for diagnostics using proper X.509 parsing
-try {
-    $PKcerts = Get-SecureBootCertSubjects -Database pk
-    if ($PKcerts) {
-        $result.SecureBootPK = ($PKcerts | ForEach-Object { if ($_.SignatureSubject -match 'CN=(.+?),') { $matches[1] } else { $_.SignatureSubject } }) -join '; '
-    }
-} catch { }
-
-try {
-    $KEKcerts = Get-SecureBootCertSubjects -Database kek
-    if ($KEKcerts) {
-        $result.SecureBootKEK = ($KEKcerts | ForEach-Object { if ($_.SignatureSubject -match 'CN=(.+?),') { $matches[1] } else { $_.SignatureSubject } }) -join '; '
-    }
-} catch { }
-
-try {
-    $dbcerts = Get-SecureBootCertSubjects -Database db
-    if ($dbcerts) {
-        $result.SecureBootDB = ($dbcerts | ForEach-Object { if ($_.SignatureSubject -match 'CN=(.+?),') { $matches[1] } else { $_.SignatureSubject } }) -join '; '
-    }
-} catch { }
 #endregion
 
 #region ---------------------------------------------------[Read registry keys]--------------------------------------------------
@@ -306,7 +334,6 @@ try {
         $throttle = Get-ItemProperty -Path "$sbServicingPath\DeviceAttributes" -Name 'CanAttemptUpdateAfter' -ErrorAction SilentlyContinue
     }
     if ($null -ne $throttle.CanAttemptUpdateAfter -and $throttle.CanAttemptUpdateAfter -ne 0) {
-        # Value is a Windows FILETIME (100-nanosecond intervals since 1601-01-01) -- convert to ISO 8601
         $result.CanAttemptUpdateAfter = [DateTime]::FromFileTimeUtc($throttle.CanAttemptUpdateAfter).ToString('o')
     }
 } catch { }
@@ -359,11 +386,21 @@ if ($null -ne $result.UEFICA2023Error -and $result.UEFICA2023Error -ne 0) {
 }
 
 # OS patch prerequisite check -- device cannot complete update without the July 2024 KB
+# Note: exit 0 with Compliant=$false so Intune does not trigger remediation (remediation cannot install OS patches)
 if ($result.OSPatchCompliant -eq $false) {
     $result.Status = 'OSPatchMissing'
     $result.Compliant = $false
     Write-Output ($result | ConvertTo-Json -Compress)
-    exit 1
+    exit 0
+}
+
+# BitLocker escrow check -- if BitLocker is on but recovery key is not escrowed, do not trigger remediation
+# Modifying Secure Boot without escrowed keys causes BitLocker recovery lockout
+if ($result.BitLockerEnabled -eq $true -and $result.BitLockerRecoveryEscrowed -eq $false) {
+    $result.Status = 'BitLockerNotEscrowed'
+    $result.Compliant = $false
+    Write-Output ($result | ConvertTo-Json -Compress)
+    exit 0
 }
 
 # Servicing status is the authoritative tracking signal (Microsoft's intended monitoring key)
@@ -383,13 +420,42 @@ if ($result.UEFICA2023Status -eq 'InProgress' -or $result.UEFICA2023Status -eq 1
     exit 1
 }
 
-# Fallback: if servicing status is absent, attempt firmware certificate check using proper X.509 parsing.
-# Only read UEFI DB/KEK when we actually need them -- avoids unnecessary UEFI reads and
-# noisy false negatives in JSON fields when servicing keys already gave a definitive answer.
+#endregion
+
+#region ---------------------------------------------------[Cert diagnostics + fallback]-----------------------------------------
+# Collect Secure Boot cert subjects using proper X.509 parsing.
+# Deferred to here so compliant devices (Updated exit above) skip the expensive UEFI reads.
+try {
+    $PKcerts = Get-SecureBootCertSubjects -Database pk
+    if ($PKcerts) {
+        $pkSubjects = ($PKcerts | ForEach-Object { if ($_.SignatureSubject -match 'CN=(.+?),') { $matches[1] } else { $_.SignatureSubject } }) -join '; '
+        if ($pkSubjects.Length -gt 500) { $pkSubjects = $pkSubjects.Substring(0,497) + '...' }
+        $result.SecureBootPK = $pkSubjects
+    }
+} catch { }
+
+try {
+    $KEKcerts = Get-SecureBootCertSubjects -Database kek
+    if ($KEKcerts) {
+        $kekSubjects = ($KEKcerts | ForEach-Object { if ($_.SignatureSubject -match 'CN=(.+?),') { $matches[1] } else { $_.SignatureSubject } }) -join '; '
+        if ($kekSubjects.Length -gt 500) { $kekSubjects = $kekSubjects.Substring(0,497) + '...' }
+        $result.SecureBootKEK = $kekSubjects
+    }
+} catch { }
+
+try {
+    $dbcerts = Get-SecureBootCertSubjects -Database db
+    if ($dbcerts) {
+        $dbSubjects = ($dbcerts | ForEach-Object { if ($_.SignatureSubject -match 'CN=(.+?),') { $matches[1] } else { $_.SignatureSubject } }) -join '; '
+        if ($dbSubjects.Length -gt 500) { $dbSubjects = $dbSubjects.Substring(0,497) + '...' }
+        $result.SecureBootDB = $dbSubjects
+    }
+} catch { }
+
+# Fallback compliance check: if servicing status is absent or NotStarted, use parsed certs
 if ([string]::IsNullOrWhiteSpace($result.UEFICA2023Status) -or $result.UEFICA2023Status -eq 'NotStarted') {
     $result.FirmwareCertCheckPerformed = $true
     try {
-        # Use proper X.509 cert parsing from Get-SecureBootCertSubjects (already collected above)
         if ($dbcerts) {
             $result.Cert2023InDB = [bool]($dbcerts | Where-Object { $_.SignatureSubject -match 'Windows UEFI CA 2023' })
         }
