@@ -3,23 +3,35 @@
     Intune Remediation Script - Secure Boot 2023 Certificate Update
 .DESCRIPTION
     Sets the registry keys to trigger Secure Boot certificate deployment,
-    opts in to Microsoft's Controlled Feature Rollout, and starts the
-    Secure Boot update scheduled task to expedite processing.
+    opts in to Microsoft's Controlled Feature Rollout, verifies BitLocker
+    recovery key escrow, and starts the Secure Boot update scheduled task.
+
+    STAGED DEPLOYMENT: This script uses a configurable AvailableUpdates value.
+    Adjust $AvailableUpdatesValue below to control which update phase is triggered:
+      Phase 1 (conservative): 0x44  = Add UEFI CA 2023 + KEK 2023 certs only
+      Phase 2 (intermediate): 0x340 = Phase 1 + Boot Manager + SVN update
+      Phase 3 (full):         0x5944 = All updates including revocations
 
     This script is safe to run on devices that have already been updated --
     if status is "Updated" or the cert is already present, it skips
     the update trigger to avoid unnecessary processing.
 
+    If AvailableUpdates is already set to a HIGHER value (e.g. 0x5944 from a
+    previous script version), the existing value is preserved to avoid
+    interrupting an in-progress update sequence.
+
     Exit 0 = Remediation applied, already updated, in progress, or not applicable (VM)
-    Exit 1 = Remediation failed, Secure Boot disabled, firmware error, or prerequisites not met
+    Exit 1 = Remediation failed, Secure Boot disabled, firmware error, BitLocker
+             not escrowed, or prerequisites not met
 .NOTES
     Deploy as: Remediation script in Intune Remediations
     Run as: System (64-bit)
-    Version: 4.0
+    Version: 5.0
     Based on original work by @MrTbone_se (T-bone Granheden) - MIT License
 #>
 
 #region ---------------------------------------------------[Functions]------------------------------------------------------------
+# IMPORTANT: This function is duplicated in the Detection script - keep both in sync
 function Get-SecureBootCertSubjects {
 <#
 .SYNOPSIS
@@ -42,12 +54,13 @@ function Get-SecureBootCertSubjects {
         $guid = [Guid][Byte[]]$db[$o..($o+15)]
         $signatureListSize = [BitConverter]::ToUInt32($db, $o+16)
         $signatureSize = [BitConverter]::ToUInt32($db, $o+24)
-        $signatureCount = ($signatureListSize - 28) / $signatureSize
+        $signatureCount = [Math]::Floor(($signatureListSize - 28) / $signatureSize)
         $so = $o + 28
         for ($i = 0; $i -lt $signatureCount; $i++) {
             $signatureOwner = [Guid][Byte[]]$db[$so..($so+15)]
             if ($guid -eq $EFI_CERT_X509_GUID) {
-                $certBytes = $db[($so+16)..($so+16+$signatureSize-1)]
+                # Cert data starts after 16-byte SignatureOwner, length = signatureSize - 16
+                $certBytes = $db[($so+16)..($so+$signatureSize-1)]
                 try {
                     $cert = if ($PSEdition -eq "Core") {
                         [System.Security.Cryptography.X509Certificates.X509Certificate]::new([Byte[]]$certBytes)
@@ -64,7 +77,7 @@ function Get-SecureBootCertSubjects {
                 $sha256Hash = ([Byte[]]$db[($so+16)..($so+47)] | ForEach-Object { $_.ToString('X2') }) -join ''
                 $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; Signature=$sha256Hash; SignatureType=$guid}
             } else {
-                $unknownData = [Byte[]]$db[($so+16)..($so+16+$signatureSize-1)]
+                $unknownData = [Byte[]]$db[($so+16)..($so+$signatureSize-1)]
                 $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; SignatureSubject="Unknown signature type"; Signature=$unknownData; SignatureType=$guid}
             }
             $so += $signatureSize
@@ -89,6 +102,22 @@ $OSversions = @(
     @{ Name='1609(LTSC)'; Build=14393; Patch=7259 }
 )
 $RemediateTaskName = "\Microsoft\Windows\PI\Secure-Boot-Update"
+
+# --- STAGED DEPLOYMENT ---
+# AvailableUpdates is a bitmask that controls which update steps are triggered:
+#   0x04  = KEK update (add KEK 2K CA 2023)
+#   0x40  = DB update (add Windows UEFI CA 2023 to Secure Boot DB)
+#   0x44  = Phase 1: Add both 2023 certs — SAFEST first step
+#   0x100 = Install 2023 Boot Manager (signed by new cert chain)
+#   0x200 = SVN update (anti-rollback counter)
+#   0x340 = Phase 2: Certs + Boot Manager + SVN
+#   0x5944 = Phase 3: Full update including all revocations — most aggressive
+#
+# Start with Phase 1 (0x44) for new deployments. After confirming certs are
+# deployed fleet-wide, increase to 0x340 or 0x5944 for subsequent phases.
+# Devices that already have a HIGHER value (e.g. 0x5944 from a previous run)
+# will keep their existing value to avoid interrupting an in-progress sequence.
+$AvailableUpdatesValue = 0x44
 #endregion
 
 #region ---------------------------------------------------[Paths]---------------------------------------------------------------
@@ -126,10 +155,9 @@ if (-not $secureBootEnabled) {
 }
 
 # Check if running in a virtual machine -- hypervisors block UEFI variable writes
-# Prefer excluding VMs from assignment; remediation exits successfully to avoid noise if they slip in
 try {
     $cs = Get-CimInstance Win32_ComputerSystem
-    $isVM = $cs.Model -match 'Virtual Machine|Virtual|VMware|VirtualBox|Hyper-V|QEMU|Parallels' -or $cs.Manufacturer -match 'VMware|QEMU|Xen|VirtualBox|innotek'
+    $isVM = $cs.Model -match 'Virtual Machine|VMware|VirtualBox|Hyper-V|QEMU|Parallels' -or $cs.Manufacturer -match 'VMware|QEMU|Xen|VirtualBox|innotek'
 } catch {
     $isVM = $false
 }
@@ -137,6 +165,56 @@ try {
 if ($isVM) {
     Write-Output "Virtual machine detected ($($cs.Manufacturer) / $($cs.Model)). Secure Boot variable writes are hypervisor-controlled. This remediation intentionally exits successfully to avoid repeated noise. Exclude VMs or handle via VM-specific process."
     exit 0
+}
+#endregion
+
+#region ---------------------------------------------------[BitLocker escrow check]----------------------------------------------
+# CRITICAL: Modifying Secure Boot DB changes PCR values. If BitLocker is on and the
+# recovery key is not escrowed, the user will be locked out with a BitLocker recovery
+# screen they cannot pass. This is the #1 bricking scenario reported by the community.
+try {
+    $blVolume = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
+    if ($blVolume -and $blVolume.ProtectionStatus -eq 'On') {
+        $recoveryProtectors = $blVolume.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' }
+        if (-not $recoveryProtectors) {
+            Write-Output "BLOCKED: BitLocker is enabled but no RecoveryPassword protector exists. Cannot safely modify Secure Boot. Add a RecoveryPassword protector and escrow to Entra ID first."
+            exit 1
+        }
+
+        # Verify recovery key is escrowed — check policy + MDM enrollment as best-effort indicators
+        $escrowConfirmed = $false
+
+        # Check if FVE policy requires AD/AAD backup (set by Intune/GPO)
+        $aadBackup = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\FVE" -Name 'ActiveDirectoryBackup' -ErrorAction SilentlyContinue
+        $osAdBackup = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\FVE" -Name 'OSActiveDirectoryBackup' -ErrorAction SilentlyContinue
+        if (($aadBackup -and $aadBackup.ActiveDirectoryBackup -eq 1) -or ($osAdBackup -and $osAdBackup.OSActiveDirectoryBackup -eq 1)) {
+            $escrowConfirmed = $true
+        }
+
+        # Fallback: Intune-managed Entra-joined devices escrow keys automatically via MDM policy
+        if (-not $escrowConfirmed) {
+            $joinInfo = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo\*' -ErrorAction SilentlyContinue
+            $mdmEnroll = Test-Path 'HKLM:\SOFTWARE\Microsoft\Enrollments\*\DMClient' -ErrorAction SilentlyContinue
+            if ($joinInfo -and $mdmEnroll) {
+                $escrowConfirmed = $true
+            }
+        }
+
+        # Last resort: attempt to trigger escrow now before proceeding
+        if (-not $escrowConfirmed) {
+            try {
+                $recoveryId = $recoveryProtectors[0].KeyProtectorId
+                BackupToAAD-BitLockerKeyProtector -MountPoint $env:SystemDrive -KeyProtectorId $recoveryId -ErrorAction Stop
+                Write-Output "BitLocker recovery key escrowed to Entra ID successfully."
+                $escrowConfirmed = $true
+            } catch {
+                Write-Output "BLOCKED: BitLocker is enabled but recovery key escrow to Entra ID could not be verified or triggered ($_). Cannot safely modify Secure Boot. Ensure the recovery key is escrowed before retrying."
+                exit 1
+            }
+        }
+    }
+} catch {
+    Write-Output "WARNING: Could not verify BitLocker status: $_. Proceeding with caution."
 }
 #endregion
 
@@ -156,11 +234,12 @@ try {
         Write-Output "OS patch prerequisite not met. Current: $($matchedOS['Name']) $Build.$Patch, Required patch level: $($matchedOS['Patch']). Install the July 2024 cumulative update first."
         exit 1
     }
-} catch { }
+} catch {
+    Write-Output "WARNING: Could not verify OS patch level: $_"
+}
 #endregion
 
 #region ---------------------------------------------------[Error state check]---------------------------------------------------
-# Check if device is in an error state -- don't retry, it needs manual investigation
 try {
     $errVal = Get-ItemProperty -Path $sbServicingPath -Name 'UEFICA2023Error' -ErrorAction SilentlyContinue
     if ($null -ne $errVal -and $null -ne $errVal.UEFICA2023Error -and $errVal.UEFICA2023Error -ne 0) {
@@ -171,7 +250,6 @@ try {
 #endregion
 
 #region ---------------------------------------------------[Already-compliant checks]--------------------------------------------
-# Check UEFICA2023Status -- this is the authoritative servicing key from Microsoft
 $servicingKeyExists = Test-Path $sbServicingPath
 try {
     $status = Get-ItemProperty -Path $sbServicingPath -Name 'UEFICA2023Status' -ErrorAction SilentlyContinue
@@ -224,23 +302,27 @@ try {
 #region ---------------------------------------------------[Apply registry keys]-------------------------------------------------
 $errors = @()
 
-# 1. Set AvailableUpdates to 0x5944 (full certificate deployment sequence)
-#    Triggers: KEK 2023, UEFI CA 2023, Production PCA, and boot manager update
-#    Skip if already non-zero -- update is already in progress and resetting would delay it
+# 1. Set AvailableUpdates (staged deployment)
+#    If already set to a HIGHER value (e.g. 0x5944 from a previous script version),
+#    keep the existing value to avoid interrupting an in-progress update sequence.
+#    Only set our value if currently zero/unset or lower than our target.
 try {
     $av = Get-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue
-    if ($null -eq $av -or $av.AvailableUpdates -eq 0) {
-        Set-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -Value 0x5944 -Type DWord -Force
-        Write-Output "Set AvailableUpdates = 0x5944"
+    $currentAvValue = if ($null -ne $av -and $null -ne $av.AvailableUpdates) { $av.AvailableUpdates } else { 0 }
+    if ($currentAvValue -eq 0) {
+        Set-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -Value $AvailableUpdatesValue -Type DWord -Force
+        Write-Output "Set AvailableUpdates = $('0x{0:X}' -f $AvailableUpdatesValue) (Phase 1: cert deployment)"
+    } elseif ($currentAvValue -ge $AvailableUpdatesValue) {
+        Write-Output "AvailableUpdates already set to $('0x{0:X}' -f $currentAvValue) (>= target $('0x{0:X}' -f $AvailableUpdatesValue)) -- keeping existing value"
     } else {
-        Write-Output "AvailableUpdates already set to $('0x{0:X}' -f $av.AvailableUpdates) -- update in progress, skipping reset"
+        Set-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -Value $AvailableUpdatesValue -Type DWord -Force
+        Write-Output "Upgraded AvailableUpdates from $('0x{0:X}' -f $currentAvValue) to $('0x{0:X}' -f $AvailableUpdatesValue)"
     }
 } catch {
     $errors += "Failed to set AvailableUpdates: $_"
 }
 
 # 2. Set MicrosoftUpdateManagedOptIn to 1 (enroll in Controlled Feature Rollout)
-#    Allows Microsoft to assist via Windows Update for high-confidence devices
 try {
     Set-ItemProperty -Path $sbPath -Name 'MicrosoftUpdateManagedOptIn' -Value 1 -Type DWord -Force
     Write-Output "Set MicrosoftUpdateManagedOptIn = 1"
@@ -265,7 +347,6 @@ if ($errors.Count -gt 0) {
 #endregion
 
 #region ---------------------------------------------------[Start scheduled task]------------------------------------------------
-# Explicitly start the Secure Boot update scheduled task to expedite processing
 try {
     Start-ScheduledTask -TaskName $RemediateTaskName -ErrorAction Stop
     Write-Output "Secure Boot update scheduled task started ($RemediateTaskName)."
