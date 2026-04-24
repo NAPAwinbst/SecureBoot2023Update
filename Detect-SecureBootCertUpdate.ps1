@@ -22,12 +22,13 @@
 .NOTES
     Deploy as: Detection script in Intune Remediations
     Run as: System (64-bit)
-    Version: 5.1
+    Version: 5.2
     Based on original work by @MrTbone_se (T-bone Granheden) - MIT License
 #>
 
 #region ---------------------------------------------------[Functions]------------------------------------------------------------
-# IMPORTANT: This function is duplicated in the Remediation script - keep both in sync
+# IMPORTANT: This function is duplicated in the Remediation script - keep both in sync.
+# Function version: 2 -- bump when changing; keep identical across both scripts.
 function Get-SecureBootCertSubjects {
 <#
 .SYNOPSIS
@@ -47,9 +48,15 @@ function Get-SecureBootCertSubjects {
     $EFI_CERT_SHA256_GUID = [guid]"c1c41626-504c-4092-aca9-41f936934328"
     $signatures = @()
     for ($o = 0; $o -lt $db.Length; ) {
+        # Require enough bytes for the 28-byte signature list header plus a guid
+        if ($db.Length - $o -lt 28) { break }
         $guid = [Guid][Byte[]]$db[$o..($o+15)]
         $signatureListSize = [BitConverter]::ToUInt32($db, $o+16)
         $signatureSize = [BitConverter]::ToUInt32($db, $o+24)
+        # Guard against malformed firmware: list header is 28 bytes, signatureSize must be nonzero.
+        # Without these checks a zero value would cause an infinite loop and hang the script.
+        if ($signatureListSize -lt 28 -or $signatureSize -eq 0) { break }
+        if ($o + $signatureListSize -gt $db.Length) { break }
         $signatureCount = [Math]::Floor(($signatureListSize - 28) / $signatureSize)
         $so = $o + 28
         for ($i = 0; $i -lt $signatureCount; $i++) {
@@ -69,7 +76,7 @@ function Get-SecureBootCertSubjects {
                 } catch {
                     $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; SignatureSubject="Failed to parse cert"; Signature=$null; SignatureType=$guid}
                 }
-            } elseif ($guid -eq $EFI_CERT_SHA256_GUID) {
+            } elseif ($guid -eq $EFI_CERT_SHA256_GUID -and $signatureSize -ge 48) {
                 $sha256Hash = ([Byte[]]$db[($so+16)..($so+47)] | ForEach-Object { $_.ToString('X2') }) -join ''
                 $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; Signature=$sha256Hash; SignatureType=$guid}
             } else {
@@ -102,7 +109,7 @@ $OSversions = @(
 #region ---------------------------------------------------[Initialize result object]--------------------------------------------
 $result = [ordered]@{
     Hostname              = $env:COMPUTERNAME
-    CollectionTime        = (Get-Date -Format 'o')
+    CollectionTime        = (Get-Date).ToUniversalTime().ToString('o')
     SecureBootEnabled     = $null
     Cert2023InDB          = $false
     KEK2023Present        = $false
@@ -230,9 +237,11 @@ try {
             if (($aadBackup -and $aadBackup.ActiveDirectoryBackup -eq 1) -or ($osAdBackup -and $osAdBackup.OSActiveDirectoryBackup -eq 1)) {
                 $result.BitLockerRecoveryEscrowed = $true
             } else {
-                # Fallback: Intune-managed Entra-joined devices escrow keys automatically via MDM policy
+                # Fallback: Intune-managed Entra-joined devices escrow keys automatically via MDM policy.
+                # Note: Test-Path with a registry wildcard is unreliable in Windows PowerShell 5.1 --
+                # enumerate explicitly via Get-ChildItem instead.
                 $joinInfo = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo\*' -ErrorAction SilentlyContinue
-                $mdmEnroll = Test-Path 'HKLM:\SOFTWARE\Microsoft\Enrollments\*\DMClient' -ErrorAction SilentlyContinue
+                $mdmEnroll = [bool](Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Enrollments\*\DMClient' -ErrorAction SilentlyContinue)
                 if ($joinInfo -and $mdmEnroll) {
                     $result.BitLockerRecoveryEscrowed = $true
                 } else {
@@ -290,10 +299,12 @@ try {
 }
 
 if (-not $result.SecureBootEnabled) {
+    # Not remediable by script: Secure Boot must be enabled in firmware/BIOS by a user/admin.
+    # exit 0 so Intune does not loop remediation endlessly; Compliant=false still surfaces the issue in reports.
     $result.Status = 'SecureBootDisabled'
     $result.Compliant = $false
     Write-Output ($result | ConvertTo-Json -Compress)
-    exit 1
+    exit 0
 }
 #endregion
 
@@ -377,7 +388,17 @@ try {
 
 #region ---------------------------------------------------[Determine compliance]------------------------------------------------
 
-# Firmware/servicing error state should always be surfaced for investigation
+# Check "Updated" first: a device that eventually succeeded can have a stale non-zero error code
+# left over from an earlier failed attempt. Checking Error before Updated would falsely flag those
+# devices non-compliant forever and cause Intune to loop remediation on a done device.
+if ($result.UEFICA2023Status -eq 'Updated') {
+    $result.Status = 'Updated'
+    $result.Compliant = $true
+    Write-Output ($result | ConvertTo-Json -Compress)
+    exit 0
+}
+
+# Firmware/servicing error state (only when not already Updated) should be surfaced for investigation
 if ($null -ne $result.UEFICA2023Error -and $result.UEFICA2023Error -ne 0) {
     $result.Status = 'Error'
     $result.Compliant = $false
@@ -403,21 +424,14 @@ if ($result.BitLockerEnabled -eq $true -and $result.BitLockerRecoveryEscrowed -e
     exit 0
 }
 
-# Servicing status is the authoritative tracking signal (Microsoft's intended monitoring key)
-if ($result.UEFICA2023Status -eq 'Updated') {
-    $result.Status = 'Updated'
-    $result.Compliant = $true
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 0
-}
-
-# In progress: servicing status indicates update sequence has started
-# Some builds may represent this differently; we defensively handle both string and integer
+# In progress: servicing status indicates update sequence has started.
+# exit 0 here to avoid re-triggering remediation (and the scheduled task) while an update is mid-flight.
+# Some builds may represent this differently; defensively handle both string and integer.
 if ($result.UEFICA2023Status -eq 'InProgress' -or $result.UEFICA2023Status -eq 1) {
     $result.Status = 'InProgress'
     $result.Compliant = $false
     Write-Output ($result | ConvertTo-Json -Compress)
-    exit 1
+    exit 0
 }
 
 #endregion
@@ -455,9 +469,15 @@ try {
 # Fallback compliance check: if servicing status is absent or NotStarted, use parsed certs
 if ([string]::IsNullOrWhiteSpace($result.UEFICA2023Status) -or $result.UEFICA2023Status -eq 'NotStarted') {
     $result.FirmwareCertCheckPerformed = $true
+    # Use -like with a trailing comma anchor so that "CN=Windows UEFI CA 2023" cannot be falsely
+    # matched by a longer CN like "CN=Windows UEFI CA 20230". Cert subjects look like
+    # "CN=Windows UEFI CA 2023, O=Microsoft Corporation, L=Redmond, S=Washington, C=US".
     try {
         if ($dbcerts) {
-            $result.Cert2023InDB = [bool]($dbcerts | Where-Object { $_.SignatureSubject -match 'Windows UEFI CA 2023' })
+            $result.Cert2023InDB = [bool]($dbcerts | Where-Object {
+                $_.SignatureSubject -like 'CN=Windows UEFI CA 2023,*' -or
+                $_.SignatureSubject -eq   'CN=Windows UEFI CA 2023'
+            })
         }
     } catch {
         $result.Cert2023InDB = $false
@@ -465,7 +485,10 @@ if ([string]::IsNullOrWhiteSpace($result.UEFICA2023Status) -or $result.UEFICA202
 
     try {
         if ($KEKcerts) {
-            $result.KEK2023Present = [bool]($KEKcerts | Where-Object { $_.SignatureSubject -match 'KEK 2K CA 2023' })
+            $result.KEK2023Present = [bool]($KEKcerts | Where-Object {
+                $_.SignatureSubject -like 'CN=Microsoft Corporation KEK 2K CA 2023,*' -or
+                $_.SignatureSubject -eq   'CN=Microsoft Corporation KEK 2K CA 2023'
+            })
         }
     } catch {
         $result.KEK2023Present = $false

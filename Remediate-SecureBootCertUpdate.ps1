@@ -26,19 +26,20 @@
 .NOTES
     Deploy as: Remediation script in Intune Remediations
     Run as: System (64-bit)
-    Version: 5.0
+    Version: 5.1
     Based on original work by @MrTbone_se (T-bone Granheden) - MIT License
 #>
 
 #region ---------------------------------------------------[Functions]------------------------------------------------------------
-# IMPORTANT: This function is duplicated in the Detection script - keep both in sync
+# IMPORTANT: This function is duplicated in the Detection script - keep both in sync.
+# Function version: 2 -- bump when changing; keep identical across both scripts.
 function Get-SecureBootCertSubjects {
 <#
 .SYNOPSIS
     Parse Secure Boot database signatures and return them as objects
 .DESCRIPTION
     Parses the EFI signature database and returns an array of PSCustomObjects
-    with proper X.509 certificate parsing.
+    with proper X.509 certificate parsing instead of ASCII string matching.
 .NOTES
     Original Author: @MrTbone_se (T-bone Granheden)
 #>
@@ -51,9 +52,15 @@ function Get-SecureBootCertSubjects {
     $EFI_CERT_SHA256_GUID = [guid]"c1c41626-504c-4092-aca9-41f936934328"
     $signatures = @()
     for ($o = 0; $o -lt $db.Length; ) {
+        # Require enough bytes for the 28-byte signature list header plus a guid
+        if ($db.Length - $o -lt 28) { break }
         $guid = [Guid][Byte[]]$db[$o..($o+15)]
         $signatureListSize = [BitConverter]::ToUInt32($db, $o+16)
         $signatureSize = [BitConverter]::ToUInt32($db, $o+24)
+        # Guard against malformed firmware: list header is 28 bytes, signatureSize must be nonzero.
+        # Without these checks a zero value would cause an infinite loop and hang the script.
+        if ($signatureListSize -lt 28 -or $signatureSize -eq 0) { break }
+        if ($o + $signatureListSize -gt $db.Length) { break }
         $signatureCount = [Math]::Floor(($signatureListSize - 28) / $signatureSize)
         $so = $o + 28
         for ($i = 0; $i -lt $signatureCount; $i++) {
@@ -73,7 +80,7 @@ function Get-SecureBootCertSubjects {
                 } catch {
                     $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; SignatureSubject="Failed to parse cert"; Signature=$null; SignatureType=$guid}
                 }
-            } elseif ($guid -eq $EFI_CERT_SHA256_GUID) {
+            } elseif ($guid -eq $EFI_CERT_SHA256_GUID -and $signatureSize -ge 48) {
                 $sha256Hash = ([Byte[]]$db[($so+16)..($so+47)] | ForEach-Object { $_.ToString('X2') }) -join ''
                 $signatures += [PSCustomObject]@{SignatureOwner=$signatureOwner; Signature=$sha256Hash; SignatureType=$guid}
             } else {
@@ -154,16 +161,23 @@ if (-not $secureBootEnabled) {
     exit 1
 }
 
-# Check if running in a virtual machine -- hypervisors block UEFI variable writes
+# Check if running in a virtual machine -- hypervisors block UEFI variable writes.
+# Capture $vmInfo in the same scope as the detection so we don't reference a null $cs later.
+$cs = $null
+$isVM = $false
+$vmInfo = 'unknown'
 try {
-    $cs = Get-CimInstance Win32_ComputerSystem
-    $isVM = $cs.Model -match 'Virtual Machine|VMware|VirtualBox|Hyper-V|QEMU|Parallels' -or $cs.Manufacturer -match 'VMware|QEMU|Xen|VirtualBox|innotek'
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+    if ($cs) {
+        $isVM = $cs.Model -match 'Virtual Machine|VMware|VirtualBox|Hyper-V|QEMU|Parallels' -or $cs.Manufacturer -match 'VMware|QEMU|Xen|VirtualBox|innotek'
+        $vmInfo = "$($cs.Manufacturer) / $($cs.Model)"
+    }
 } catch {
     $isVM = $false
 }
 
 if ($isVM) {
-    Write-Output "Virtual machine detected ($($cs.Manufacturer) / $($cs.Model)). Secure Boot variable writes are hypervisor-controlled. This remediation intentionally exits successfully to avoid repeated noise. Exclude VMs or handle via VM-specific process."
+    Write-Output "Virtual machine detected ($vmInfo). Secure Boot variable writes are hypervisor-controlled. This remediation intentionally exits successfully to avoid repeated noise. Exclude VMs or handle via VM-specific process."
     exit 0
 }
 #endregion
@@ -191,20 +205,29 @@ try {
             $escrowConfirmed = $true
         }
 
-        # Fallback: Intune-managed Entra-joined devices escrow keys automatically via MDM policy
+        # Fallback: Intune-managed Entra-joined devices escrow keys automatically via MDM policy.
+        # Note: Test-Path with a registry wildcard is unreliable in Windows PowerShell 5.1 --
+        # enumerate explicitly via Get-ChildItem instead.
         if (-not $escrowConfirmed) {
             $joinInfo = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo\*' -ErrorAction SilentlyContinue
-            $mdmEnroll = Test-Path 'HKLM:\SOFTWARE\Microsoft\Enrollments\*\DMClient' -ErrorAction SilentlyContinue
+            $mdmEnroll = [bool](Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Enrollments\*\DMClient' -ErrorAction SilentlyContinue)
             if ($joinInfo -and $mdmEnroll) {
                 $escrowConfirmed = $true
             }
         }
 
-        # Last resort: attempt to trigger escrow now before proceeding
+        # Last resort: attempt to trigger escrow now before proceeding.
+        # The cmdlet is BackupToAAD-BitLockerKeyProtector on most Windows builds but may be missing
+        # on some newer OS builds -- detect availability before calling to avoid CommandNotFoundException.
         if (-not $escrowConfirmed) {
             try {
                 $recoveryId = $recoveryProtectors[0].KeyProtectorId
-                BackupToAAD-BitLockerKeyProtector -MountPoint $env:SystemDrive -KeyProtectorId $recoveryId -ErrorAction Stop
+                $backupCmd = Get-Command BackupToAAD-BitLockerKeyProtector -ErrorAction SilentlyContinue
+                if (-not $backupCmd) {
+                    Write-Output "BLOCKED: BackupToAAD-BitLockerKeyProtector cmdlet is not available on this OS build. Cannot trigger Entra ID escrow from the script. Verify MDM policy escrows BitLocker keys, then retry."
+                    exit 1
+                }
+                & $backupCmd.Name -MountPoint $env:SystemDrive -KeyProtectorId $recoveryId -ErrorAction Stop
                 Write-Output "BitLocker recovery key escrowed to Entra ID successfully."
                 $escrowConfirmed = $true
             } catch {
@@ -230,7 +253,10 @@ try {
         if ($matchedOS['Patch'] -eq 0) { $osPatchOk = $true }
         elseif ($null -ne $Patch -and $Patch -ge $matchedOS['Patch']) { $osPatchOk = $true }
     }
-    if (-not $osPatchOk -and $null -ne $matchedOS) {
+    if ($null -eq $matchedOS) {
+        # Unknown build -- do not silently continue; Intune will re-run on a known good build.
+        Write-Output "WARNING: OS build '$Build' is not in the known-version table. Proceeding with remediation but patch prerequisite could not be verified."
+    } elseif (-not $osPatchOk) {
         Write-Output "OS patch prerequisite not met. Current: $($matchedOS['Name']) $Build.$Patch, Required patch level: $($matchedOS['Patch']). Install the July 2024 cumulative update first."
         exit 1
     }
@@ -266,11 +292,19 @@ try {
 # Fallback firmware cert check using proper X.509 parsing
 if (-not $servicingKeyExists -or ($null -eq $status) -or ($null -eq $status.UEFICA2023Status) -or $status.UEFICA2023Status -eq 'NotStarted') {
     try {
+        # Use -like with a trailing comma anchor so that "CN=Windows UEFI CA 2023" cannot be falsely
+        # matched by a longer CN like "CN=Windows UEFI CA 20230".
         $dbcerts = Get-SecureBootCertSubjects -Database db
-        $dbHas2023 = [bool]($dbcerts | Where-Object { $_.SignatureSubject -match 'Windows UEFI CA 2023' })
+        $dbHas2023 = [bool]($dbcerts | Where-Object {
+            $_.SignatureSubject -like 'CN=Windows UEFI CA 2023,*' -or
+            $_.SignatureSubject -eq   'CN=Windows UEFI CA 2023'
+        })
 
         $KEKcerts = Get-SecureBootCertSubjects -Database kek
-        $kekHas2023 = [bool]($KEKcerts | Where-Object { $_.SignatureSubject -match 'KEK 2K CA 2023' })
+        $kekHas2023 = [bool]($KEKcerts | Where-Object {
+            $_.SignatureSubject -like 'CN=Microsoft Corporation KEK 2K CA 2023,*' -or
+            $_.SignatureSubject -eq   'CN=Microsoft Corporation KEK 2K CA 2023'
+        })
 
         if ($dbHas2023 -and $kekHas2023) {
             Write-Output "Both 2023 certificates found in firmware (X.509 cert check). No action needed."
@@ -300,26 +334,30 @@ try {
 #endregion
 
 #region ---------------------------------------------------[Apply registry keys]-------------------------------------------------
-$errors = @()
+# Use a non-default name; $errors is a PowerShell automatic variable alias for the error stream.
+$remediationErrors = @()
 
-# 1. Set AvailableUpdates (staged deployment)
-#    If already set to a HIGHER value (e.g. 0x5944 from a previous script version),
-#    keep the existing value to avoid interrupting an in-progress update sequence.
-#    Only set our value if currently zero/unset or lower than our target.
+# 1. Set AvailableUpdates (staged deployment).
+#    AvailableUpdates is a BITMASK -- a numeric >= comparison is semantically wrong (e.g. 0x100
+#    > 0x44 numerically, yet 0x100 lacks the cert bits that 0x44 sets). Instead: OR our target
+#    bits onto whatever Windows has already set. If every bit we want is already present, skip
+#    the write so we never interrupt an in-progress sequence.
 try {
     $av = Get-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue
     $currentAvValue = if ($null -ne $av -and $null -ne $av.AvailableUpdates) { $av.AvailableUpdates } else { 0 }
-    if ($currentAvValue -eq 0) {
-        Set-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -Value $AvailableUpdatesValue -Type DWord -Force
-        Write-Output "Set AvailableUpdates = $('0x{0:X}' -f $AvailableUpdatesValue) (Phase 1: cert deployment)"
-    } elseif ($currentAvValue -ge $AvailableUpdatesValue) {
-        Write-Output "AvailableUpdates already set to $('0x{0:X}' -f $currentAvValue) (>= target $('0x{0:X}' -f $AvailableUpdatesValue)) -- keeping existing value"
+    $targetValue = $currentAvValue -bor $AvailableUpdatesValue
+    if ($targetValue -eq $currentAvValue) {
+        Write-Output "AvailableUpdates already contains target bits ($('0x{0:X}' -f $currentAvValue) has $('0x{0:X}' -f $AvailableUpdatesValue)) -- no change"
     } else {
-        Set-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -Value $AvailableUpdatesValue -Type DWord -Force
-        Write-Output "Upgraded AvailableUpdates from $('0x{0:X}' -f $currentAvValue) to $('0x{0:X}' -f $AvailableUpdatesValue)"
+        Set-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -Value $targetValue -Type DWord -Force
+        if ($currentAvValue -eq 0) {
+            Write-Output "Set AvailableUpdates = $('0x{0:X}' -f $targetValue) (Phase 1: cert deployment)"
+        } else {
+            Write-Output "Merged AvailableUpdates: $('0x{0:X}' -f $currentAvValue) -bor $('0x{0:X}' -f $AvailableUpdatesValue) = $('0x{0:X}' -f $targetValue)"
+        }
     }
 } catch {
-    $errors += "Failed to set AvailableUpdates: $_"
+    $remediationErrors += "Failed to set AvailableUpdates: $_"
 }
 
 # 2. Set MicrosoftUpdateManagedOptIn to 1 (enroll in Controlled Feature Rollout)
@@ -327,7 +365,7 @@ try {
     Set-ItemProperty -Path $sbPath -Name 'MicrosoftUpdateManagedOptIn' -Value 1 -Type DWord -Force
     Write-Output "Set MicrosoftUpdateManagedOptIn = 1"
 } catch {
-    $errors += "Failed to set MicrosoftUpdateManagedOptIn: $_"
+    $remediationErrors += "Failed to set MicrosoftUpdateManagedOptIn: $_"
 }
 
 # 3. Ensure HighConfidenceOptOut is 0 (do not block automatic updates)
@@ -340,8 +378,8 @@ try {
 }
 
 # Check for critical errors before proceeding
-if ($errors.Count -gt 0) {
-    foreach ($e in $errors) { Write-Output "ERROR: $e" }
+if ($remediationErrors.Count -gt 0) {
+    foreach ($e in $remediationErrors) { Write-Output "ERROR: $e" }
     exit 1
 }
 #endregion

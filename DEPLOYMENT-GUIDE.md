@@ -15,11 +15,23 @@
 - Otherwise collects full registry and event log status and → **exit 1 (non-compliant)**, triggering remediation
 
 **Remediation** sets:
-- `AvailableUpdates` = `0x5944` — triggers the full certificate deployment sequence
+- `AvailableUpdates` — triggers certificate deployment. **Staged by phase** (see below). The value is OR-merged onto whatever Windows already has so existing bits are never cleared.
 - `MicrosoftUpdateManagedOptIn` = `1` — enrolls in Microsoft's Controlled Feature Rollout
 - `HighConfidenceOptOut` = `0` — ensures automatic monthly updates aren't blocked
 
 The remediation skips devices that are already updated to avoid unnecessary work.
+
+### Staged deployment of `AvailableUpdates`
+
+The script's `$AvailableUpdatesValue` variable controls which phase is applied. Default is **Phase 1**. Advance phases manually once the fleet is stable at the previous phase.
+
+| Phase | Value | Bits | What it triggers |
+|-------|-------|------|------------------|
+| 1 (default, safest) | `0x44` | KEK + DB | Add Windows UEFI CA 2023 to the DB and KEK 2K CA 2023 to the KEK |
+| 2 (intermediate) | `0x340` | Phase 1 + `0x100` Boot Manager + `0x200` SVN | Install the 2023-signed boot manager and advance the anti-rollback counter |
+| 3 (full rollout) | `0x5944` | Phase 2 + revocations | Complete update including revocations of the 2011 cert chain |
+
+Edit `$AvailableUpdatesValue` in `Remediate-SecureBootCertUpdate.ps1` to advance. Devices that already have higher bits set will keep them — the script only adds the missing ones.
 
 > **Alternative:** Microsoft's Intune Settings Catalog (Devices > Configuration > Settings Catalog > search "Secure Boot") can deploy these same three registry values natively without a custom remediation script. Use this package for detection/reporting regardless — it gives you the detailed JSON status per device that Settings Catalog alone cannot provide.
 
@@ -70,7 +82,7 @@ Add the column **Pre-remediation detection output** to see the JSON status per d
 | `CanAttemptUpdateAfter` | If set, Microsoft is throttling this device until that date — nothing will happen until then |
 | `WindowsUEFICA2023Capable` | `0` = Microsoft hasn't cleared this device for the update yet (CFR). `1` = cleared and ready |
 | `ConfidenceLevel` | Microsoft's CFR confidence assessment — explains why `WindowsUEFICA2023Capable` may be 0 |
-| `AvailableUpdates` | `0x5944` → triggered. `0x4104` → OEM KEK not yet signed (emits 1803, will retry). `0x4100` → reboot needed. `0x4000` → nearly done. `0x0` → complete |
+| `AvailableUpdates` | `0x44` → Phase 1 triggered. `0x340` → Phase 2 triggered. `0x5944` → Phase 3 triggered. `0x400` → Windows-managed default. `0x4104` → OEM KEK not yet signed (emits 1803, will retry). `0x4100` → reboot needed. `0x4000` → nearly done. `0x0` → complete |
 | `Event1808Count` | > 0 = certificates successfully applied |
 | `Event1801Count` | > 0 = certificates available but not yet applied (pending or stuck) |
 | `Event1795Count` | > 0 = firmware error when writing certs to UEFI variables — check OEM BIOS update |
@@ -122,7 +134,7 @@ $csv | ForEach-Object {
 
 | Symptom | Cause | Action |
 |---------|-------|--------|
-| `AvailableUpdates` stuck at `0x5944` | Scheduled task hasn't run yet | Wait 12 hours or manually run `Start-ScheduledTask -TaskName "\Microsoft\Windows\PI\Secure-Boot-Update"` |
+| `AvailableUpdates` stuck at the configured phase value (e.g. `0x44`, `0x340`, or `0x5944`) | Scheduled task hasn't run yet | Wait 12 hours or manually run `Start-ScheduledTask -TaskName "\Microsoft\Windows\PI\Secure-Boot-Update"` |
 | `AvailableUpdates` stuck at `0x4104` | OEM hasn't signed the 2023 KEK with their Platform Key | Windows will keep retrying (Event 1803 each attempt). Contact OEM for firmware update. |
 | `AvailableUpdates` stuck at `0x4100` | Needs a reboot to continue | Reboot the device |
 | `UEFICA2023Error` has a non-zero value | A specific update step failed | Check `UEFICA2023ErrorEvent` for the event code, then look in Event Viewer System log |
