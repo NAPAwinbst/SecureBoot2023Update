@@ -3,8 +3,8 @@
     Intune Remediation Detection Script - Secure Boot 2023 Certificate Update
 .DESCRIPTION
     Checks whether the device needs Secure Boot certificate updates.
-    Exit 0 = Compliant (no action needed)
-    Exit 1 = Non-Compliant (remediation needed or attention required)
+    Exit 0 = Do not run remediation (compliant, not applicable, already in progress, or manual action required)
+    Exit 1 = Remediable state detected (Intune should run remediation)
 
     The pre-remediation detection output is a JSON string with detailed
     device status for reporting in the Intune admin center.
@@ -12,6 +12,10 @@
     Status values:
       "Updated"             - 2023 certs present, fully updated
       "InProgress"          - Update sequence has started but not finished
+      "InProgressPendingReboot" - Update is waiting for a reboot
+      "InProgressWithFirmwareErrors" - Update is running but firmware failure events were seen
+      "WaitingForMicrosoftCFR" - Microsoft Controlled Feature Rollout is throttling the device
+      "FirmwareKekFailure"  - KEK update appears blocked by firmware/OEM state
       "Error"               - Update was attempted but hit an error
       "NotStarted"          - Secure Boot enabled but no update initiated
       "SecureBootDisabled"  - Secure Boot is off; cannot apply cert updates
@@ -22,7 +26,7 @@
 .NOTES
     Deploy as: Detection script in Intune Remediations
     Run as: System (64-bit)
-    Version: 5.2
+    Version: 5.3
     Based on original work by @MrTbone_se (T-bone Granheden) - MIT License
 #>
 
@@ -89,6 +93,68 @@ function Get-SecureBootCertSubjects {
     }
     return $signatures
 }
+
+function Write-DetectionResult {
+    param(
+        [Parameter(Mandatory=$true)]
+        [int]$ExitCode
+    )
+
+    if ($result.Status -eq 'Updated') {
+        $result.PhaseTargetMet = $true
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$result.RecommendedAction)) {
+        $result.RecommendedAction = switch ($result.Status) {
+            'Updated'                      { 'None' }
+            'VirtualMachine'               { 'ExcludeVirtualMachine' }
+            'SecureBootDisabled'           { 'EnableSecureBootInFirmware' }
+            'PrerequisitesNotMet'          { 'FixIntuneRemediationAssignment' }
+            'OSPatchMissing'               { 'InstallWindowsUpdates' }
+            'BitLockerNotEscrowed'         { 'EscrowBitLockerRecoveryKey' }
+            'Error'                        { 'UpdateBIOSOrContactOEM' }
+            'InProgressWithFirmwareErrors' { 'UpdateBIOSOrContactOEM' }
+            'FirmwareKekFailure'           { 'UpdateBIOSOrContactOEM' }
+            'InProgressPendingReboot'      { 'RebootDevice' }
+            'WaitingForMicrosoftCFR'       { 'WaitForMicrosoftCFR' }
+            'InProgress'                   { 'WaitForNextCheckInOrReboot' }
+            'NotStarted'                   { 'RunRemediation' }
+            default                        { 'ReviewDevice' }
+        }
+    }
+
+    Write-Output ($result | ConvertTo-Json -Compress)
+    exit $ExitCode
+}
+
+function Set-SecureBootEventSummary {
+    param(
+        [Parameter(Mandatory=$true)]
+        [int]$EventId,
+        [Parameter(Mandatory=$true)]
+        [string]$CountProperty,
+        [Parameter(Mandatory=$true)]
+        [string]$LatestTimeProperty,
+        [switch]$FailureEvent
+    )
+
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-TPM-WMI'; Id=$EventId; StartTime=$eventCutoff} -ErrorAction SilentlyContinue)
+        $result[$CountProperty] = $events.Count
+        $latest = $events | Sort-Object TimeCreated -Descending | Select-Object -First 1
+        if ($latest) {
+            $result[$LatestTimeProperty] = $latest.TimeCreated.ToUniversalTime().ToString('o')
+            if ($FailureEvent) {
+                $result.LatestFailureEventId = $latest.Id
+                $result.LatestFailureTime = $latest.TimeCreated.ToUniversalTime().ToString('o')
+                $shortMsg = ([string]$latest.Message -replace '\s+',' ') -replace '(.{250}).+','$1...'
+                $result.LatestFailureMessage = $shortMsg
+            }
+        }
+    } catch {
+        $result.EventQueryError = $_.Exception.Message
+    }
+}
 #endregion
 
 #region ---------------------------------------------------[Configuration]-------------------------------------------------------
@@ -104,12 +170,20 @@ $OSversions = @(
     @{ Name='1809(LTSC)'; Build=17763; Patch=6054 }
     @{ Name='1609(LTSC)'; Build=14393; Patch=7259 }
 )
+$ScriptVersion = '5.3'
+$DesiredPhase = 'Phase1'
+$DesiredAvailableUpdatesValue = 0x44
+$DesiredAvailableUpdates = '0x{0:X}' -f $DesiredAvailableUpdatesValue
 #endregion
 
 #region ---------------------------------------------------[Initialize result object]--------------------------------------------
 $result = [ordered]@{
     Hostname              = $env:COMPUTERNAME
     CollectionTime        = (Get-Date).ToUniversalTime().ToString('o')
+    ScriptVersion         = $ScriptVersion
+    DesiredPhase          = $DesiredPhase
+    DesiredAvailableUpdates = $DesiredAvailableUpdates
+    PhaseTargetMet        = $null
     SecureBootEnabled     = $null
     Cert2023InDB          = $false
     KEK2023Present        = $false
@@ -124,8 +198,18 @@ $result = [ordered]@{
     WindowsUEFICA2023Capable    = $null
     Event1808Count        = 0
     Event1801Count        = 0
+    Event1802Count        = 0
     Event1795Count        = 0
     Event1796Count        = 0
+    Latest1808Time        = $null
+    Latest1801Time        = $null
+    Latest1802Time        = $null
+    Latest1795Time        = $null
+    Latest1796Time        = $null
+    LatestFailureEventId  = $null
+    LatestFailureTime     = $null
+    LatestFailureMessage  = $null
+    EventQueryError       = $null
     OSVersion             = $null
     OSName                = $null
     OSPatchCompliant      = $null
@@ -149,6 +233,8 @@ $result = [ordered]@{
     SecureBootDB          = $null
     FirmwareCertCheckPerformed = $false
     Status                = 'Unknown'
+    StatusDetail          = $null
+    RecommendedAction     = $null
     Compliant             = $false
 }
 #endregion
@@ -202,8 +288,7 @@ try {
 if ([IntPtr]::Size -ne 8) {
     $result.Status = 'PrerequisitesNotMet'
     $result.Compliant = $false
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 1
+    Write-DetectionResult -ExitCode 1
 }
 
 # Validate elevated privileges (SYSTEM or Administrator)
@@ -212,8 +297,7 @@ $isElevated = $identity.User.Value -eq "S-1-5-18" -or ([Security.Principal.Windo
 if (-not $isElevated) {
     $result.Status = 'PrerequisitesNotMet'
     $result.Compliant = $false
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 1
+    Write-DetectionResult -ExitCode 1
 }
 #endregion
 
@@ -286,8 +370,7 @@ try {
 if ($result.IsVirtualMachine) {
     $result.Status = 'VirtualMachine'
     $result.Compliant = $true
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 0
+    Write-DetectionResult -ExitCode 0
 }
 #endregion
 
@@ -303,8 +386,7 @@ if (-not $result.SecureBootEnabled) {
     # exit 0 so Intune does not loop remediation endlessly; Compliant=false still surfaces the issue in reports.
     $result.Status = 'SecureBootDisabled'
     $result.Compliant = $false
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 0
+    Write-DetectionResult -ExitCode 0
 }
 #endregion
 
@@ -315,7 +397,11 @@ $sbDeviceAttributesPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Dev
 
 try {
     $av = Get-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue
-    if ($null -ne $av.AvailableUpdates) { $result.AvailableUpdates = '0x{0:X}' -f $av.AvailableUpdates }
+    if ($null -ne $av.AvailableUpdates) {
+        $availableUpdatesValue = [int]$av.AvailableUpdates
+        $result.AvailableUpdates = '0x{0:X}' -f $availableUpdatesValue
+        $result.PhaseTargetMet = (($availableUpdatesValue -band $DesiredAvailableUpdatesValue) -eq $DesiredAvailableUpdatesValue)
+    }
 } catch { }
 
 try {
@@ -369,21 +455,11 @@ try {
 # Last 30 days only -- unbounded queries can timeout on large logs
 $eventCutoff = (Get-Date).AddDays(-30)
 
-try {
-    $result.Event1808Count = @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=1808; StartTime=$eventCutoff} -ErrorAction SilentlyContinue).Count
-} catch { }
-
-try {
-    $result.Event1801Count = @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=1801; StartTime=$eventCutoff} -ErrorAction SilentlyContinue).Count
-} catch { }
-
-try {
-    $result.Event1795Count = @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=1795; StartTime=$eventCutoff} -ErrorAction SilentlyContinue).Count
-} catch { }
-
-try {
-    $result.Event1796Count = @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=1796; StartTime=$eventCutoff} -ErrorAction SilentlyContinue).Count
-} catch { }
+Set-SecureBootEventSummary -EventId 1808 -CountProperty 'Event1808Count' -LatestTimeProperty 'Latest1808Time'
+Set-SecureBootEventSummary -EventId 1801 -CountProperty 'Event1801Count' -LatestTimeProperty 'Latest1801Time'
+Set-SecureBootEventSummary -EventId 1802 -CountProperty 'Event1802Count' -LatestTimeProperty 'Latest1802Time' -FailureEvent
+Set-SecureBootEventSummary -EventId 1795 -CountProperty 'Event1795Count' -LatestTimeProperty 'Latest1795Time' -FailureEvent
+Set-SecureBootEventSummary -EventId 1796 -CountProperty 'Event1796Count' -LatestTimeProperty 'Latest1796Time' -FailureEvent
 #endregion
 
 #region ---------------------------------------------------[Determine compliance]------------------------------------------------
@@ -394,16 +470,16 @@ try {
 if ($result.UEFICA2023Status -eq 'Updated') {
     $result.Status = 'Updated'
     $result.Compliant = $true
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 0
+    Write-DetectionResult -ExitCode 0
 }
 
-# Firmware/servicing error state (only when not already Updated) should be surfaced for investigation
+# Firmware/servicing error state (only when not already Updated) is not fixed by rewriting registry keys.
+# Exit 0 avoids repeatedly running remediation across the fleet; the JSON still reports Compliant=false.
 if ($null -ne $result.UEFICA2023Error -and $result.UEFICA2023Error -ne 0) {
     $result.Status = 'Error'
+    $result.StatusDetail = "UEFICA2023Error=$($result.UEFICA2023Error); UEFICA2023ErrorEvent=$($result.UEFICA2023ErrorEvent)"
     $result.Compliant = $false
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 1
+    Write-DetectionResult -ExitCode 0
 }
 
 # OS patch prerequisite check -- device cannot complete update without the July 2024 KB
@@ -411,8 +487,7 @@ if ($null -ne $result.UEFICA2023Error -and $result.UEFICA2023Error -ne 0) {
 if ($result.OSPatchCompliant -eq $false) {
     $result.Status = 'OSPatchMissing'
     $result.Compliant = $false
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 0
+    Write-DetectionResult -ExitCode 0
 }
 
 # BitLocker escrow check -- if BitLocker is on but recovery key is not escrowed, do not trigger remediation
@@ -420,18 +495,32 @@ if ($result.OSPatchCompliant -eq $false) {
 if ($result.BitLockerEnabled -eq $true -and $result.BitLockerRecoveryEscrowed -eq $false) {
     $result.Status = 'BitLockerNotEscrowed'
     $result.Compliant = $false
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 0
+    Write-DetectionResult -ExitCode 0
 }
 
 # In progress: servicing status indicates update sequence has started.
 # exit 0 here to avoid re-triggering remediation (and the scheduled task) while an update is mid-flight.
 # Some builds may represent this differently; defensively handle both string and integer.
 if ($result.UEFICA2023Status -eq 'InProgress' -or $result.UEFICA2023Status -eq 1) {
-    $result.Status = 'InProgress'
+    $canAttemptAfterUtc = $null
+    if ($result.CanAttemptUpdateAfter) {
+        try { $canAttemptAfterUtc = [DateTime]::Parse($result.CanAttemptUpdateAfter).ToUniversalTime() } catch { }
+    }
+
+    if ($result.AvailableUpdates -eq '0x4100') {
+        $result.Status = 'InProgressPendingReboot'
+        $result.StatusDetail = 'AvailableUpdates indicates the update is waiting for a reboot.'
+    } elseif ($canAttemptAfterUtc -and $canAttemptAfterUtc -gt (Get-Date).ToUniversalTime()) {
+        $result.Status = 'WaitingForMicrosoftCFR'
+        $result.StatusDetail = "Microsoft throttling is active until $($result.CanAttemptUpdateAfter)."
+    } elseif (($result.Event1795Count -gt 0 -or $result.Event1796Count -gt 0 -or $result.Event1802Count -gt 0) -and $result.Event1808Count -eq 0) {
+        $result.Status = 'InProgressWithFirmwareErrors'
+        $result.StatusDetail = 'Update is in progress, but firmware failure events were observed and no success event was found.'
+    } else {
+        $result.Status = 'InProgress'
+    }
     $result.Compliant = $false
-    Write-Output ($result | ConvertTo-Json -Compress)
-    exit 0
+    Write-DetectionResult -ExitCode 0
 }
 
 #endregion
@@ -498,22 +587,25 @@ if ([string]::IsNullOrWhiteSpace($result.UEFICA2023Status) -or $result.UEFICA202
     if ($result.Cert2023InDB -and $result.KEK2023Present) {
         $result.Status = 'Updated'
         $result.Compliant = $true
-        Write-Output ($result | ConvertTo-Json -Compress)
-        exit 0
+        Write-DetectionResult -ExitCode 0
     }
 
     # Partial progress heuristic: DB has 2023 cert but KEK still missing
     if ($result.Cert2023InDB -and (-not $result.KEK2023Present)) {
+        if ($result.Event1796Count -gt 0) {
+            $result.Status = 'FirmwareKekFailure'
+            $result.StatusDetail = 'Windows UEFI CA 2023 is present in DB, but KEK 2K CA 2023 is missing and KEK failure events were observed.'
+            $result.Compliant = $false
+            Write-DetectionResult -ExitCode 0
+        }
         $result.Status = 'InProgress'
         $result.Compliant = $false
-        Write-Output ($result | ConvertTo-Json -Compress)
-        exit 1
+        Write-DetectionResult -ExitCode 1
     }
 }
 
 # Not started: Secure Boot is on but no success signals detected
 $result.Status = 'NotStarted'
 $result.Compliant = $false
-Write-Output ($result | ConvertTo-Json -Compress)
-exit 1
+Write-DetectionResult -ExitCode 1
 #endregion

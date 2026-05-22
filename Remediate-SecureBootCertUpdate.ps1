@@ -26,7 +26,7 @@
 .NOTES
     Deploy as: Remediation script in Intune Remediations
     Run as: System (64-bit)
-    Version: 5.1
+    Version: 5.2
     Based on original work by @MrTbone_se (T-bone Granheden) - MIT License
 #>
 
@@ -108,7 +108,10 @@ $OSversions = @(
     @{ Name='1809(LTSC)'; Build=17763; Patch=6054 }
     @{ Name='1609(LTSC)'; Build=14393; Patch=7259 }
 )
-$RemediateTaskName = "\Microsoft\Windows\PI\Secure-Boot-Update"
+$ScriptVersion = '5.2'
+$RemediateTaskPath = "\Microsoft\Windows\PI\"
+$RemediateTaskName = "Secure-Boot-Update"
+$RemediateTaskFullName = "$RemediateTaskPath$RemediateTaskName"
 
 # --- STAGED DEPLOYMENT ---
 # AvailableUpdates is a bitmask that controls which update steps are triggered:
@@ -130,21 +133,103 @@ $AvailableUpdatesValue = 0x44
 #region ---------------------------------------------------[Paths]---------------------------------------------------------------
 $sbPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot'
 $sbServicingPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing'
+$napaStatePath = 'HKLM:\SOFTWARE\NAPA\SecureBoot2023'
+#endregion
+
+#region ---------------------------------------------------[Structured result]-----------------------------------------------------
+function Format-HexDword {
+    param($Value)
+    if ($null -eq $Value) { return 'not set' }
+    return ('0x{0:X}' -f [int]$Value)
+}
+
+$remediationResult = [ordered]@{
+    Hostname                 = $env:COMPUTERNAME
+    CollectionTime           = (Get-Date).ToUniversalTime().ToString('o')
+    CompletedTime            = $null
+    ScriptVersion            = $ScriptVersion
+    Outcome                  = 'Unknown'
+    RecommendedAction        = $null
+    BlockedReason            = $null
+    TargetAvailableUpdates   = ('0x{0:X}' -f $AvailableUpdatesValue)
+    PreAvailableUpdates      = $null
+    PostAvailableUpdates     = $null
+    PreUEFICA2023Status      = $null
+    PreUEFICA2023Error       = $null
+    TaskStartResult          = $null
+    RequiresReboot           = $false
+    Messages                 = @()
+    Errors                   = @()
+    StateWriteError          = $null
+}
+
+function Add-RemediationMessage {
+    param([string]$Message)
+    if (-not [string]::IsNullOrWhiteSpace($Message)) {
+        $script:remediationResult['Messages'] = @($script:remediationResult['Messages']) + $Message
+    }
+}
+
+function Add-RemediationError {
+    param([string]$Message)
+    if (-not [string]::IsNullOrWhiteSpace($Message)) {
+        $script:remediationResult['Errors'] = @($script:remediationResult['Errors']) + $Message
+    }
+}
+
+function Complete-Remediation {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Outcome,
+        [Parameter(Mandatory=$true)]
+        [int]$ExitCode,
+        [string]$RecommendedAction,
+        [string]$BlockedReason
+    )
+
+    $script:remediationResult.Outcome = $Outcome
+    $script:remediationResult.CompletedTime = (Get-Date).ToUniversalTime().ToString('o')
+    if (-not [string]::IsNullOrWhiteSpace($RecommendedAction)) {
+        $script:remediationResult.RecommendedAction = $RecommendedAction
+    }
+    if (-not [string]::IsNullOrWhiteSpace($BlockedReason)) {
+        $script:remediationResult.BlockedReason = $BlockedReason
+    }
+
+    try {
+        New-Item -Path $napaStatePath -Force -ErrorAction Stop | Out-Null
+        $lastAvailableUpdates = if (-not [string]::IsNullOrWhiteSpace([string]$script:remediationResult.PostAvailableUpdates)) {
+            $script:remediationResult.PostAvailableUpdates
+        } elseif (-not [string]::IsNullOrWhiteSpace([string]$script:remediationResult.PreAvailableUpdates)) {
+            $script:remediationResult.PreAvailableUpdates
+        } else {
+            'not set'
+        }
+        Set-ItemProperty -Path $napaStatePath -Name 'LastRemediationUtc' -Value $script:remediationResult.CompletedTime -Type String -Force -ErrorAction Stop
+        Set-ItemProperty -Path $napaStatePath -Name 'LastRemediationOutcome' -Value $script:remediationResult.Outcome -Type String -Force -ErrorAction Stop
+        Set-ItemProperty -Path $napaStatePath -Name 'LastRecommendedAction' -Value ([string]$script:remediationResult.RecommendedAction) -Type String -Force -ErrorAction Stop
+        Set-ItemProperty -Path $napaStatePath -Name 'LastAvailableUpdates' -Value $lastAvailableUpdates -Type String -Force -ErrorAction Stop
+        Set-ItemProperty -Path $napaStatePath -Name 'ScriptVersion' -Value $script:remediationResult.ScriptVersion -Type String -Force -ErrorAction Stop
+    } catch {
+        $script:remediationResult.StateWriteError = $_.Exception.Message
+    }
+
+    Write-Output ($script:remediationResult | ConvertTo-Json -Compress -Depth 5)
+    exit $ExitCode
+}
 #endregion
 
 #region ---------------------------------------------------[Prerequisites check]-------------------------------------------------
 # Validate 64-bit PowerShell
 if ([IntPtr]::Size -ne 8) {
-    Write-Output "ERROR: Script requires 64-bit PowerShell (running $([IntPtr]::Size * 8)-bit)."
-    exit 1
+    Complete-Remediation -Outcome 'Blocked' -ExitCode 1 -RecommendedAction 'FixIntuneRemediationAssignment' -BlockedReason "Script requires 64-bit PowerShell (running $([IntPtr]::Size * 8)-bit)."
 }
 
 # Validate elevated privileges (SYSTEM or Administrator)
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isElevated = $identity.User.Value -eq "S-1-5-18" -or ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isElevated) {
-    Write-Output "ERROR: Script requires elevated privileges (SYSTEM or Administrator)."
-    exit 1
+    Complete-Remediation -Outcome 'Blocked' -ExitCode 1 -RecommendedAction 'FixIntuneRemediationAssignment' -BlockedReason 'Script requires elevated privileges (SYSTEM or Administrator).'
 }
 #endregion
 
@@ -157,8 +242,7 @@ try {
 }
 
 if (-not $secureBootEnabled) {
-    Write-Output "Secure Boot is not enabled. Cannot apply certificate updates. Manual intervention required."
-    exit 1
+    Complete-Remediation -Outcome 'Blocked' -ExitCode 1 -RecommendedAction 'EnableSecureBootInFirmware' -BlockedReason 'Secure Boot is not enabled. Cannot apply certificate updates.'
 }
 
 # Check if running in a virtual machine -- hypervisors block UEFI variable writes.
@@ -177,8 +261,7 @@ try {
 }
 
 if ($isVM) {
-    Write-Output "Virtual machine detected ($vmInfo). Secure Boot variable writes are hypervisor-controlled. This remediation intentionally exits successfully to avoid repeated noise. Exclude VMs or handle via VM-specific process."
-    exit 0
+    Complete-Remediation -Outcome 'NotApplicable' -ExitCode 0 -RecommendedAction 'ExcludeVirtualMachine' -BlockedReason "Virtual machine detected ($vmInfo). Secure Boot variable writes are hypervisor-controlled."
 }
 #endregion
 
@@ -191,8 +274,7 @@ try {
     if ($blVolume -and $blVolume.ProtectionStatus -eq 'On') {
         $recoveryProtectors = $blVolume.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' }
         if (-not $recoveryProtectors) {
-            Write-Output "BLOCKED: BitLocker is enabled but no RecoveryPassword protector exists. Cannot safely modify Secure Boot. Add a RecoveryPassword protector and escrow to Entra ID first."
-            exit 1
+            Complete-Remediation -Outcome 'Blocked' -ExitCode 1 -RecommendedAction 'EscrowBitLockerRecoveryKey' -BlockedReason 'BitLocker is enabled but no RecoveryPassword protector exists. Cannot safely modify Secure Boot.'
         }
 
         # Verify recovery key is escrowed — check policy + MDM enrollment as best-effort indicators
@@ -224,20 +306,18 @@ try {
                 $recoveryId = $recoveryProtectors[0].KeyProtectorId
                 $backupCmd = Get-Command BackupToAAD-BitLockerKeyProtector -ErrorAction SilentlyContinue
                 if (-not $backupCmd) {
-                    Write-Output "BLOCKED: BackupToAAD-BitLockerKeyProtector cmdlet is not available on this OS build. Cannot trigger Entra ID escrow from the script. Verify MDM policy escrows BitLocker keys, then retry."
-                    exit 1
+                    Complete-Remediation -Outcome 'Blocked' -ExitCode 1 -RecommendedAction 'EscrowBitLockerRecoveryKey' -BlockedReason 'BackupToAAD-BitLockerKeyProtector cmdlet is not available on this OS build. Cannot trigger Entra ID escrow from the script.'
                 }
-                & $backupCmd.Name -MountPoint $env:SystemDrive -KeyProtectorId $recoveryId -ErrorAction Stop
-                Write-Output "BitLocker recovery key escrowed to Entra ID successfully."
+                & $backupCmd.Name -MountPoint $env:SystemDrive -KeyProtectorId $recoveryId -ErrorAction Stop | Out-Null
+                Add-RemediationMessage 'BitLocker recovery key escrowed to Entra ID successfully.'
                 $escrowConfirmed = $true
             } catch {
-                Write-Output "BLOCKED: BitLocker is enabled but recovery key escrow to Entra ID could not be verified or triggered ($_). Cannot safely modify Secure Boot. Ensure the recovery key is escrowed before retrying."
-                exit 1
+                Complete-Remediation -Outcome 'Blocked' -ExitCode 1 -RecommendedAction 'EscrowBitLockerRecoveryKey' -BlockedReason "BitLocker is enabled but recovery key escrow to Entra ID could not be verified or triggered ($($_.Exception.Message))."
             }
         }
     }
 } catch {
-    Write-Output "WARNING: Could not verify BitLocker status: $_. Proceeding with caution."
+    Complete-Remediation -Outcome 'Blocked' -ExitCode 1 -RecommendedAction 'VerifyBitLockerRecoveryKey' -BlockedReason "Could not verify BitLocker status. Refusing to modify Secure Boot variables until recovery-key safety is confirmed. $($_.Exception.Message)"
 }
 #endregion
 
@@ -255,13 +335,12 @@ try {
     }
     if ($null -eq $matchedOS) {
         # Unknown build -- do not silently continue; Intune will re-run on a known good build.
-        Write-Output "WARNING: OS build '$Build' is not in the known-version table. Proceeding with remediation but patch prerequisite could not be verified."
+        Add-RemediationMessage "WARNING: OS build '$Build' is not in the known-version table. Proceeding with remediation but patch prerequisite could not be verified."
     } elseif (-not $osPatchOk) {
-        Write-Output "OS patch prerequisite not met. Current: $($matchedOS['Name']) $Build.$Patch, Required patch level: $($matchedOS['Patch']). Install the July 2024 cumulative update first."
-        exit 1
+        Complete-Remediation -Outcome 'Blocked' -ExitCode 1 -RecommendedAction 'InstallWindowsUpdates' -BlockedReason "OS patch prerequisite not met. Current: $($matchedOS['Name']) $Build.$Patch, Required patch level: $($matchedOS['Patch'])."
     }
 } catch {
-    Write-Output "WARNING: Could not verify OS patch level: $_"
+    Add-RemediationMessage "WARNING: Could not verify OS patch level: $($_.Exception.Message)"
 }
 #endregion
 
@@ -269,8 +348,7 @@ try {
 try {
     $errVal = Get-ItemProperty -Path $sbServicingPath -Name 'UEFICA2023Error' -ErrorAction SilentlyContinue
     if ($null -ne $errVal -and $null -ne $errVal.UEFICA2023Error -and $errVal.UEFICA2023Error -ne 0) {
-        Write-Output "UEFICA2023Error = $($errVal.UEFICA2023Error). Device has a firmware-level failure. Setting registry keys will not fix this. Investigate: check BIOS version, Event Viewer (1795/1796), and contact OEM if needed."
-        exit 1
+        Complete-Remediation -Outcome 'Blocked' -ExitCode 1 -RecommendedAction 'UpdateBIOSOrContactOEM' -BlockedReason "UEFICA2023Error = $($errVal.UEFICA2023Error). Device has a firmware-level failure. Setting registry keys will not fix this."
     }
 } catch { }
 #endregion
@@ -280,12 +358,10 @@ $servicingKeyExists = Test-Path $sbServicingPath
 try {
     $status = Get-ItemProperty -Path $sbServicingPath -Name 'UEFICA2023Status' -ErrorAction SilentlyContinue
     if ($status -and $status.UEFICA2023Status -eq 'Updated') {
-        Write-Output "UEFICA2023Status = Updated. Device already compliant. No action needed."
-        exit 0
+        Complete-Remediation -Outcome 'AlreadyCompliant' -ExitCode 0 -RecommendedAction 'None'
     }
     if ($status -and $status.UEFICA2023Status -eq 'InProgress') {
-        Write-Output "UEFICA2023Status = InProgress. Update is already running. No action needed."
-        exit 0
+        Complete-Remediation -Outcome 'AlreadyInProgress' -ExitCode 0 -RecommendedAction 'WaitForNextCheckInOrReboot'
     }
 } catch { }
 
@@ -307,8 +383,7 @@ if (-not $servicingKeyExists -or ($null -eq $status) -or ($null -eq $status.UEFI
         })
 
         if ($dbHas2023 -and $kekHas2023) {
-            Write-Output "Both 2023 certificates found in firmware (X.509 cert check). No action needed."
-            exit 0
+            Complete-Remediation -Outcome 'AlreadyCompliant' -ExitCode 0 -RecommendedAction 'None'
         }
     } catch { }
 }
@@ -321,6 +396,9 @@ try {
     $currentErr = Get-ItemProperty -Path $sbServicingPath -Name 'UEFICA2023Error' -ErrorAction SilentlyContinue
     $currentOptIn = Get-ItemProperty -Path $sbPath -Name 'MicrosoftUpdateManagedOptIn' -ErrorAction SilentlyContinue
     $currentOptOut = Get-ItemProperty -Path $sbPath -Name 'HighConfidenceOptOut' -ErrorAction SilentlyContinue
+    $remediationResult.PreAvailableUpdates = if ($null -ne $currentAv.AvailableUpdates) { Format-HexDword $currentAv.AvailableUpdates } else { 'not set' }
+    $remediationResult.PreUEFICA2023Status = if ($null -ne $currentStatus.UEFICA2023Status) { $currentStatus.UEFICA2023Status } else { 'not set' }
+    $remediationResult.PreUEFICA2023Error = if ($null -ne $currentErr.UEFICA2023Error) { $currentErr.UEFICA2023Error } else { 'none' }
     $stateMsg = "Current state: " +
         "AvailableUpdates=$( if ($null -ne $currentAv.AvailableUpdates) { '0x{0:X}' -f $currentAv.AvailableUpdates } else { 'not set' } ), " +
         "UEFICA2023Status=$( if ($null -ne $currentStatus.UEFICA2023Status) { $currentStatus.UEFICA2023Status } else { 'not set' } ), " +
@@ -329,7 +407,7 @@ try {
         "OptOut=$( if ($null -ne $currentOptOut.HighConfidenceOptOut) { $currentOptOut.HighConfidenceOptOut } else { 'not set' } )"
     if (-not $servicingKeyExists) { $stateMsg += " [Servicing key does not exist -- update has never been initiated on this device]" }
     elseif ($null -eq $currentStatus.UEFICA2023Status) { $stateMsg += " [Servicing key exists but status is not set -- update may not have started yet]" }
-    Write-Output $stateMsg
+    Add-RemediationMessage $stateMsg
 } catch { }
 #endregion
 
@@ -347,50 +425,62 @@ try {
     $currentAvValue = if ($null -ne $av -and $null -ne $av.AvailableUpdates) { $av.AvailableUpdates } else { 0 }
     $targetValue = $currentAvValue -bor $AvailableUpdatesValue
     if ($targetValue -eq $currentAvValue) {
-        Write-Output "AvailableUpdates already contains target bits ($('0x{0:X}' -f $currentAvValue) has $('0x{0:X}' -f $AvailableUpdatesValue)) -- no change"
+        Add-RemediationMessage "AvailableUpdates already contains target bits ($('0x{0:X}' -f $currentAvValue) has $('0x{0:X}' -f $AvailableUpdatesValue)) -- no change"
     } else {
-        Set-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -Value $targetValue -Type DWord -Force
+        Set-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -Value $targetValue -Type DWord -Force -ErrorAction Stop
         if ($currentAvValue -eq 0) {
-            Write-Output "Set AvailableUpdates = $('0x{0:X}' -f $targetValue) (Phase 1: cert deployment)"
+            Add-RemediationMessage "Set AvailableUpdates = $('0x{0:X}' -f $targetValue) (Phase 1: cert deployment)"
         } else {
-            Write-Output "Merged AvailableUpdates: $('0x{0:X}' -f $currentAvValue) -bor $('0x{0:X}' -f $AvailableUpdatesValue) = $('0x{0:X}' -f $targetValue)"
+            Add-RemediationMessage "Merged AvailableUpdates: $('0x{0:X}' -f $currentAvValue) -bor $('0x{0:X}' -f $AvailableUpdatesValue) = $('0x{0:X}' -f $targetValue)"
         }
     }
 } catch {
-    $remediationErrors += "Failed to set AvailableUpdates: $_"
+    $remediationErrors += "Failed to set AvailableUpdates: $($_.Exception.Message)"
 }
 
 # 2. Set MicrosoftUpdateManagedOptIn to 1 (enroll in Controlled Feature Rollout)
 try {
-    Set-ItemProperty -Path $sbPath -Name 'MicrosoftUpdateManagedOptIn' -Value 1 -Type DWord -Force
-    Write-Output "Set MicrosoftUpdateManagedOptIn = 1"
+    Set-ItemProperty -Path $sbPath -Name 'MicrosoftUpdateManagedOptIn' -Value 1 -Type DWord -Force -ErrorAction Stop
+    Add-RemediationMessage "Set MicrosoftUpdateManagedOptIn = 1"
 } catch {
-    $remediationErrors += "Failed to set MicrosoftUpdateManagedOptIn: $_"
+    $remediationErrors += "Failed to set MicrosoftUpdateManagedOptIn: $($_.Exception.Message)"
 }
 
 # 3. Ensure HighConfidenceOptOut is 0 (do not block automatic updates)
 try {
-    Set-ItemProperty -Path $sbPath -Name 'HighConfidenceOptOut' -Value 0 -Type DWord -Force
-    Write-Output "Set HighConfidenceOptOut = 0"
+    Set-ItemProperty -Path $sbPath -Name 'HighConfidenceOptOut' -Value 0 -Type DWord -Force -ErrorAction Stop
+    Add-RemediationMessage "Set HighConfidenceOptOut = 0"
 } catch {
-    # Non-fatal -- log but continue
-    Write-Output "WARNING: Failed to set HighConfidenceOptOut: $_"
+    Add-RemediationMessage "WARNING: Failed to set HighConfidenceOptOut: $($_.Exception.Message)"
 }
 
 # Check for critical errors before proceeding
 if ($remediationErrors.Count -gt 0) {
-    foreach ($e in $remediationErrors) { Write-Output "ERROR: $e" }
-    exit 1
+    foreach ($e in $remediationErrors) { Add-RemediationError $e }
+    Complete-Remediation -Outcome 'Failed' -ExitCode 1 -RecommendedAction 'ReviewRemediationErrors' -BlockedReason 'One or more required registry writes failed.'
 }
 #endregion
 
 #region ---------------------------------------------------[Start scheduled task]------------------------------------------------
 try {
-    Start-ScheduledTask -TaskName $RemediateTaskName -ErrorAction Stop
-    Write-Output "Secure Boot update scheduled task started ($RemediateTaskName)."
+    Start-ScheduledTask -TaskPath $RemediateTaskPath -TaskName $RemediateTaskName -ErrorAction Stop | Out-Null
+    $remediationResult.TaskStartResult = 'StartedWithStartScheduledTask'
+    Add-RemediationMessage "Secure Boot update scheduled task started ($RemediateTaskFullName)."
 } catch {
-    # Non-fatal -- task may not exist on all OS versions, or may already be running
-    Write-Output "WARNING: Could not start scheduled task '$RemediateTaskName': $_. The update will process on its normal schedule or after reboot."
+    $startScheduledTaskError = $_.Exception.Message
+    try {
+        $taskOutput = & "$env:SystemRoot\System32\schtasks.exe" /Run /TN $RemediateTaskFullName 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $remediationResult.TaskStartResult = 'StartedWithSchtasks'
+            Add-RemediationMessage "Secure Boot update scheduled task started with schtasks.exe ($RemediateTaskFullName)."
+        } else {
+            $remediationResult.TaskStartResult = "DeferredToNormalSchedule"
+            Add-RemediationMessage "WARNING: Could not start scheduled task '$RemediateTaskFullName'. Start-ScheduledTask: $startScheduledTaskError. schtasks.exe exit code: $LASTEXITCODE. Output: $taskOutput. The update will process on its normal schedule or after reboot."
+        }
+    } catch {
+        $remediationResult.TaskStartResult = "DeferredToNormalSchedule"
+        Add-RemediationMessage "WARNING: Could not start scheduled task '$RemediateTaskFullName'. Start-ScheduledTask: $startScheduledTaskError. schtasks.exe: $($_.Exception.Message). The update will process on its normal schedule or after reboot."
+    }
 }
 #endregion
 
@@ -399,9 +489,11 @@ try {
     $postAv = Get-ItemProperty -Path $sbPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue
     $postOptIn = Get-ItemProperty -Path $sbPath -Name 'MicrosoftUpdateManagedOptIn' -ErrorAction SilentlyContinue
     $postOptOut = Get-ItemProperty -Path $sbPath -Name 'HighConfidenceOptOut' -ErrorAction SilentlyContinue
-    Write-Output "Post-write state: AvailableUpdates=$( if ($null -ne $postAv.AvailableUpdates) { '0x{0:X}' -f $postAv.AvailableUpdates } else { 'not set' } ), OptIn=$( if ($null -ne $postOptIn.MicrosoftUpdateManagedOptIn) { $postOptIn.MicrosoftUpdateManagedOptIn } else { 'not set' } ), OptOut=$( if ($null -ne $postOptOut.HighConfidenceOptOut) { $postOptOut.HighConfidenceOptOut } else { 'not set' } )"
+    $remediationResult.PostAvailableUpdates = if ($null -ne $postAv.AvailableUpdates) { Format-HexDword $postAv.AvailableUpdates } else { 'not set' }
+    Add-RemediationMessage "Post-write state: AvailableUpdates=$($remediationResult.PostAvailableUpdates), OptIn=$( if ($null -ne $postOptIn.MicrosoftUpdateManagedOptIn) { $postOptIn.MicrosoftUpdateManagedOptIn } else { 'not set' } ), OptOut=$( if ($null -ne $postOptOut.HighConfidenceOptOut) { $postOptOut.HighConfidenceOptOut } else { 'not set' } )"
 } catch { }
 
-Write-Output "Remediation complete. At least one reboot is required to finalize the Secure Boot certificate update."
-exit 0
+$remediationResult.RequiresReboot = $true
+Add-RemediationMessage "Remediation complete. At least one reboot is required to finalize the Secure Boot certificate update."
+Complete-Remediation -Outcome 'Applied' -ExitCode 0 -RecommendedAction 'RebootDevice'
 #endregion

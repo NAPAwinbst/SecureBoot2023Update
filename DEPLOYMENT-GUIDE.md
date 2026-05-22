@@ -12,12 +12,16 @@
 **Detection** checks:
 - Is Secure Boot enabled? (if not → non-compliant, flagged)
 - Is "Windows UEFI CA 2023" present in the Secure Boot DB AND "Microsoft Corporation KEK 2K CA 2023" in KEK? → **exit 0 (compliant)**
-- Otherwise collects full registry and event log status and → **exit 1 (non-compliant)**, triggering remediation
+- Otherwise collects full registry and event log status and returns JSON with `Status`, `Compliant`, and `RecommendedAction`.
+- Manual-action states such as `SecureBootDisabled`, `OSPatchMissing`, `BitLockerNotEscrowed`, firmware errors, and stuck in-progress devices exit 0 with `Compliant=false` in JSON so Intune does not repeatedly run remediation that cannot fix them.
+- Remediable `NotStarted` and partial-progress states still exit 1 to trigger remediation.
 
 **Remediation** sets:
 - `AvailableUpdates` — triggers certificate deployment. **Staged by phase** (see below). The value is OR-merged onto whatever Windows already has so existing bits are never cleared.
 - `MicrosoftUpdateManagedOptIn` = `1` — enrolls in Microsoft's Controlled Feature Rollout
 - `HighConfidenceOptOut` = `0` — ensures automatic monthly updates aren't blocked
+- Starts the Windows Secure Boot update task using `Start-ScheduledTask -TaskPath "\Microsoft\Windows\PI\" -TaskName "Secure-Boot-Update"` with a `schtasks.exe` fallback.
+- Emits structured JSON in the remediation output with outcome, pre/post registry state, task-start result, and next recommended action.
 
 The remediation skips devices that are already updated to avoid unnecessary work.
 
@@ -73,6 +77,13 @@ Add the column **Pre-remediation detection output** to see the JSON status per d
 
 | Field | What to look for |
 |-------|-----------------|
+| `ScriptVersion` | Detection script version that produced the row |
+| `Status` | High-level script classification. Current values include `Updated`, `NotStarted`, `InProgress`, `InProgressPendingReboot`, `InProgressWithFirmwareErrors`, `WaitingForMicrosoftCFR`, `FirmwareKekFailure`, `Error`, `SecureBootDisabled`, `VirtualMachine`, `OSPatchMissing`, and `BitLockerNotEscrowed` |
+| `Compliant` | Device-side compliance result from the script. This can be `false` even when the detection script exits 0 for manual-action states |
+| `RecommendedAction` | Single triage action such as `None`, `RunRemediation`, `RebootDevice`, `WaitForMicrosoftCFR`, `UpdateBIOSOrContactOEM`, `EnableSecureBootInFirmware`, `EscrowBitLockerRecoveryKey`, or `InstallWindowsUpdates` |
+| `StatusDetail` | Extra reason for non-standard statuses, especially firmware errors and throttling |
+| `DesiredPhase` / `DesiredAvailableUpdates` | Current package target. Keep these aligned with `$AvailableUpdatesValue` in the remediation script |
+| `PhaseTargetMet` | `true` if the configured phase bits are already present, or the device is fully `Updated` |
 | `SecureBootEnabled` | `false` = Secure Boot off, device flagged non-compliant |
 | `Cert2023InDB` | `true` = new cert is in firmware DB |
 | `KEK2023Present` | `true` = new KEK is enrolled |
@@ -85,8 +96,11 @@ Add the column **Pre-remediation detection output** to see the JSON status per d
 | `AvailableUpdates` | `0x44` → Phase 1 triggered. `0x340` → Phase 2 triggered. `0x5944` → Phase 3 triggered. `0x400` → Windows-managed default. `0x4104` → OEM KEK not yet signed (emits 1803, will retry). `0x4100` → reboot needed. `0x4000` → nearly done. `0x0` → complete |
 | `Event1808Count` | > 0 = certificates successfully applied |
 | `Event1801Count` | > 0 = certificates available but not yet applied (pending or stuck) |
+| `Event1802Count` | > 0 = firmware/servicing error event was observed |
 | `Event1795Count` | > 0 = firmware error when writing certs to UEFI variables — check OEM BIOS update |
 | `Event1796Count` | > 0 = KEK update specifically failed — OEM may need to sign the new KEK |
+| `Latest1808Time`, `Latest1801Time`, `Latest1802Time`, `Latest1795Time`, `Latest1796Time` | UTC timestamp for the newest matching TPM-WMI event in the last 30 days |
+| `LatestFailureEventId` / `LatestFailureMessage` | Most recent 1802/1795/1796 failure event details, truncated for Intune output |
 | `IsVirtualMachine` | `true` = VM detected; cert writes are blocked by hypervisor, exclude from this remediation |
 | `MicrosoftUpdateOptIn` | `1` = enrolled in CFR |
 | `HighConfidenceOptOut` | `0` or null = not blocking automatic updates |
@@ -104,8 +118,13 @@ $csv | ForEach-Object {
     $json = $_.PreRemediationDetectionScriptOutput | ConvertFrom-Json
     [PSCustomObject]@{
         Device                   = $json.Hostname
+        ScriptVersion            = $json.ScriptVersion
         Status                   = $json.Status
         Compliant                = $json.Compliant
+        RecommendedAction        = $json.RecommendedAction
+        StatusDetail             = $json.StatusDetail
+        DesiredPhase             = $json.DesiredPhase
+        PhaseTargetMet           = $json.PhaseTargetMet
         SecureBoot               = $json.SecureBootEnabled
         Cert2023InDB             = $json.Cert2023InDB
         KEK2023Present           = $json.KEK2023Present
@@ -119,8 +138,11 @@ $csv | ForEach-Object {
         OptIn                    = $json.MicrosoftUpdateOptIn
         Event1808                = $json.Event1808Count
         Event1801                = $json.Event1801Count
+        Event1802                = $json.Event1802Count
         Event1795                = $json.Event1795Count
         Event1796                = $json.Event1796Count
+        LatestFailureEventId     = $json.LatestFailureEventId
+        LatestFailureTime        = $json.LatestFailureTime
         IsVM                     = $json.IsVirtualMachine
         Manufacturer             = $json.Manufacturer
         Model                    = $json.Model
@@ -130,14 +152,34 @@ $csv | ForEach-Object {
 } | Export-Csv ".\SecureBootStatus.csv" -NoTypeInformation
 ```
 
+### Remediation output JSON
+
+The remediation output is now also JSON. Useful fields:
+
+| Field | What it means |
+|-------|---------------|
+| `Outcome` | `Applied`, `AlreadyCompliant`, `AlreadyInProgress`, `NotApplicable`, `Blocked`, or `Failed` |
+| `RecommendedAction` | Next action after remediation, commonly `RebootDevice`, `WaitForNextCheckInOrReboot`, `UpdateBIOSOrContactOEM`, or `EscrowBitLockerRecoveryKey` |
+| `TargetAvailableUpdates` | Configured staged rollout value, currently `0x44` |
+| `PreAvailableUpdates` / `PostAvailableUpdates` | Registry value before and after remediation |
+| `TaskStartResult` | `StartedWithStartScheduledTask`, `StartedWithSchtasks`, or `DeferredToNormalSchedule` |
+| `RequiresReboot` | `true` when registry keys were applied and a reboot is needed to continue |
+| `BlockedReason` | Why remediation refused to proceed |
+
+The remediation also writes a local breadcrumb to `HKLM:\SOFTWARE\NAPA\SecureBoot2023` with the last remediation time, outcome, recommended action, available-updates value, and script version for helpdesk/local diagnostics.
+
 ## Troubleshooting
 
 | Symptom | Cause | Action |
 |---------|-------|--------|
-| `AvailableUpdates` stuck at the configured phase value (e.g. `0x44`, `0x340`, or `0x5944`) | Scheduled task hasn't run yet | Wait 12 hours or manually run `Start-ScheduledTask -TaskName "\Microsoft\Windows\PI\Secure-Boot-Update"` |
+| `AvailableUpdates` stuck at the configured phase value (e.g. `0x44`, `0x340`, or `0x5944`) | Scheduled task hasn't run yet | Wait 12 hours or manually run `Start-ScheduledTask -TaskPath "\Microsoft\Windows\PI\" -TaskName "Secure-Boot-Update"` |
 | `AvailableUpdates` stuck at `0x4104` | OEM hasn't signed the 2023 KEK with their Platform Key | Windows will keep retrying (Event 1803 each attempt). Contact OEM for firmware update. |
 | `AvailableUpdates` stuck at `0x4100` | Needs a reboot to continue | Reboot the device |
 | `UEFICA2023Error` has a non-zero value | A specific update step failed | Check `UEFICA2023ErrorEvent` for the event code, then look in Event Viewer System log |
+| `Status` = `InProgressPendingReboot` | Update is waiting for a reboot | Reboot the device and allow the scheduled task/reporting cycle to run |
+| `Status` = `InProgressWithFirmwareErrors` | Device is in progress but has 1802/1795/1796 failure events and no 1808 success | Update BIOS/firmware, then rerun detection; contact OEM if current firmware still fails |
+| `Status` = `WaitingForMicrosoftCFR` | Microsoft throttling is active | Wait until `CanAttemptUpdateAfter`, then re-check |
+| `Status` = `FirmwareKekFailure` | DB cert is present but KEK 2023 is missing and KEK failures were seen | Update BIOS/firmware or contact OEM |
 | `Event1795Count` > 0 | Firmware rejected the certificate write | Check OEM for a BIOS update. Device firmware cannot accept the cert at this version. |
 | `Event1796Count` > 0 | KEK update specifically failed | OEM may not have signed the new KEK with their Platform Key. Contact OEM. |
 | `Event1801Count` > 0, no 1795/1796 | Certs available but not yet applied | Check `CanAttemptUpdateAfter` — device may be throttled by Microsoft CFR. Also check `WindowsUEFICA2023Capable` in the Servicing registry key. |
